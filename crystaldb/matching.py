@@ -34,6 +34,8 @@ KNOWN = "known"
 NEW_POLYMORPH = "new polymorph"
 NEW_COMPOSITION = "new composition"
 REFERENCE = "reference"
+# Parsed primitive cells kept per process (a few KB each).
+PRIMITIVE_CACHE_SIZE = 50_000
 
 
 @lru_cache(maxsize=1)
@@ -52,6 +54,20 @@ def primitive(structure: Structure) -> Structure:
         return structure.get_primitive_structure()
     except Exception:
         return structure
+
+
+@lru_cache(maxsize=PRIMITIVE_CACHE_SIZE)
+def primitive_from_cif(cif: str) -> Optional[Structure]:
+    """A stored geometry's primitive cell, or None if it does not parse.
+
+    Parsing and reducing is most of the cost of matching, and a long-lived
+    process (a web container) matches the same formulas again and again, so
+    results are kept by CIF text. Treat the result as read-only.
+    """
+    try:
+        return primitive(Structure.from_str(cif, fmt="cif"))
+    except Exception:
+        return None
 
 
 def rms_distance(a: Structure, b: Structure) -> Optional[float]:
@@ -86,15 +102,15 @@ class Candidate:
     formula: str
     space_group_number: Optional[int]
     cif: str
+    # Sites in the stored cell, a multiple of the primitive cell's.
+    num_atoms: Optional[int] = None
     _primitive: Optional[Structure] = field(default=None, repr=False)
 
     def primitive(self) -> Optional[Structure]:
         if self._primitive is None:
-            try:
-                self._primitive = primitive(Structure.from_str(self.cif, fmt="cif"))
-            except Exception as exc:
-                logger.debug("Could not parse %s: %s", self.structure_id, exc)
-                return None
+            self._primitive = primitive_from_cif(self.cif)
+            if self._primitive is None:
+                logger.debug("Could not parse %s", self.structure_id)
         return self._primitive
 
 
@@ -103,6 +119,11 @@ def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[
     query = primitive(structure)
     matches: List[Match] = []
     for candidate in candidates:
+        # Primitive cells of different sizes never match, and a stored cell
+        # holds a whole number of its primitive cells, so most candidates
+        # are ruled out without parsing them.
+        if candidate.num_atoms and candidate.num_atoms % len(query):
+            continue
         other = candidate.primitive()
         if other is None:
             continue

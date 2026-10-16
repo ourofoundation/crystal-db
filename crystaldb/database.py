@@ -1425,6 +1425,7 @@ class StructureDatabase:
         rows = self.conn.execute(
             """
             SELECT s.id, s.source, s.source_id, s.formula, s.space_group_number,
+                s.num_atoms,
                 COALESCE(
                     (SELECT g.cif FROM geometries g
                      WHERE g.structure_id = s.id AND g.kind = 'source'),
@@ -1444,6 +1445,7 @@ class StructureDatabase:
                 formula=row["formula"],
                 space_group_number=row["space_group_number"],
                 cif=decompress_cif(row["cif"]),
+                num_atoms=row["num_atoms"],
             )
             for row in rows
             if row["cif"] is not None
@@ -1560,6 +1562,45 @@ class StructureDatabase:
         return [self._row_to_run(row) for row in rows]
 
     # -------------------- Statistics & Queries --------------------
+
+    def record_source_counts(self) -> Dict[str, int]:
+        """Store the number of valid structures per source in ``meta``.
+
+        Counting scans the whole table, which is slow on a network
+        filesystem, so the writer records the counts on its local copy and
+        readers take them from ``source_counts``.
+        """
+        counts = {
+            row[0]: row[1]
+            for row in self.conn.execute(
+                "SELECT source, COUNT(*) FROM structures WHERE is_valid = 1 GROUP BY source"
+            )
+        }
+        self.conn.execute("DELETE FROM meta WHERE key LIKE 'count:%'")
+        self.conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ((f"count:{source}", str(n)) for source, n in counts.items()),
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('counted_at', ?)", (_now(),)
+        )
+        self._commit()
+        return counts
+
+    def source_counts(self) -> Dict[str, Dict[str, Any]]:
+        """Per source: ``structures`` (as of the writer's last count, or None)
+        and ``imported_at`` (when its reference data was last imported)."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, value in self.conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'count:%' OR key LIKE 'imported:%'"
+        ):
+            kind, source = key.split(":", 1)
+            entry = out.setdefault(source, {"structures": None, "imported_at": None})
+            if kind == "count":
+                entry["structures"] = int(value)
+            else:
+                entry["imported_at"] = value
+        return out
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get database statistics, including breakdown by source."""

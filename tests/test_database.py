@@ -230,6 +230,26 @@ def test_novelty(db):
     assert index.classify(mp) == REFERENCE
 
 
+def test_novelty_skips_candidates_of_another_size(db):
+    add(db, b2("Fe", "Ni"), None, source="mp", source_id="mp-2")
+    supercell = b2("Fe", "Ni")
+    supercell.make_supercell([2, 1, 1])
+    add(db, supercell, None, source="mp", source_id="mp-4")
+    # Fe-Fe-Ni-Ni layers: a primitive cell of 4 sites.
+    layered = Structure(
+        Lattice.tetragonal(2.5, 7.2),
+        ["Fe", "Fe", "Ni", "Ni"],
+        [[0, 0, 0], [0.5, 0.5, 0.25], [0, 0, 0.5], [0.5, 0.5, 0.75]],
+    )
+    index = db.novelty_index()
+    result = index.check(layered)
+    assert result.status == NEW_POLYMORPH
+    assert result.same_formula_counts == {"mp": 2}
+    # The 2-site cell can't hold a 4-site primitive cell, so it is never parsed.
+    parsed = {c.source_id for c in index.candidates("FeNi") if c._primitive is not None}
+    assert parsed == {"mp-4"}
+
+
 def test_refuses_version_1_schema(tmp_path):
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)

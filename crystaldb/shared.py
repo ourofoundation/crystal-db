@@ -131,9 +131,13 @@ class SharedDatabase:
         systems = list(chemical_systems)
         with tempfile.TemporaryDirectory(prefix="crystaldb-work-") as tmp:
             work_path = Path(tmp) / "work.db"
+            extracting = time.time()
             with self.reader(surface) as reader:
                 count = reader.extract_systems(work_path, systems)
-            logger.info("Working copy of %s: %d structures", ", ".join(systems), count)
+            logger.info(
+                "Working copy of %s: %d structures in %.1f s",
+                ", ".join(systems), count, time.time() - extracting,
+            )
 
             since = datetime.now().isoformat()
             db = StructureDatabase(work_path, surface=surface)
@@ -147,11 +151,15 @@ class SharedDatabase:
                     # A run that finished must not fail because its results
                     # could not be saved for later runs.
                     try:
+                        sending = time.time()
                         if ingest is not None:
                             result = ingest(delta_path.read_bytes())
                         else:
                             result = self.submit(delta_path)
-                        logger.info("Sent %d changed structures to the writer: %s", changed, result)
+                        logger.info(
+                            "Sent %d changed structures to the writer in %.1f s: %s",
+                            changed, time.time() - sending, result,
+                        )
                     except Exception:
                         logger.exception("Could not send %d changed structures to the writer", changed)
 
@@ -212,6 +220,7 @@ class SharedDatabase:
             shutil.copyfile(self.path, local)
             yield local
             db = StructureDatabase(local)
+            db.record_source_counts()
             db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             db.close()
             staged = self.path.with_suffix(".staged")
@@ -223,10 +232,10 @@ class SharedDatabase:
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
             self.volume.commit()
 
-    def merge_shard(self, shard: bytes, recompute_hulls: bool = False) -> dict:
-        """Merge one shard given as bytes (writers deployed before the inbox)."""
-        if recompute_hulls:
-            logger.info("recompute_hulls ignored: the hulls task refreshes stored hulls")
+    def merge_shard(self, shard: bytes) -> dict:
+        """Put one shard (as bytes) in the inbox and drain it here: a
+        working copy's ``ingest`` when this process is the writer (tests,
+        local databases)."""
         self.inbox.mkdir(parents=True, exist_ok=True)
         name = f"{datetime.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:12]}.db"
         (self.inbox / f"{name}.part").write_bytes(shard)

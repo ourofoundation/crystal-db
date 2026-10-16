@@ -86,6 +86,8 @@ def test_exclusive_local_copy_writes_back(shared):
     assert shared.volume.commits == 1
     with shared.reader() as db:
         assert db.get_structures_by_formula("Cr2")
+        # Counted on the local copy, so readers never scan the table.
+        assert db.source_counts()["ggen"]["structures"] == 2
 
 
 def test_failed_maintenance_leaves_file_alone(shared):

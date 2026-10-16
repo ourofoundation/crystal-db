@@ -28,6 +28,12 @@ ADDED = "added"
 UPDATED = "updated"
 EXISTS = "exists"
 
+# Energies closer than this (eV/atom) count as the same score: repeated GPU
+# runs of one structure differ in the last float32 digits.
+SAME_ENERGY_EV = 1e-4
+# Metadata that names the run, not the structure.
+RUN_METADATA = ("action_id",)
+
 
 @dataclass
 class Intake:
@@ -37,6 +43,28 @@ class Intake:
     match: Optional[Match]
     # How the structure compares with published data (known, new polymorph, ...).
     novelty: NoveltyResult
+
+
+def _unchanged(
+    db: "StructureDatabase",
+    structure_id: str,
+    cif: str,
+    energy_per_atom: float,
+    metadata: Optional[Dict[str, Any]],
+) -> bool:
+    """Whether a stored row already holds this geometry, energy and metadata."""
+    stored = db.get_structure(structure_id)
+    if stored is None or not stored.is_valid or stored.energy_per_atom is None:
+        return False
+    if abs(stored.energy_per_atom - energy_per_atom) > SAME_ENERGY_EV:
+        return False
+    if db.get_geometry(structure_id, db.surface) != cif:
+        return False
+
+    def identity(meta):
+        return {k: v for k, v in (meta or {}).items() if k not in RUN_METADATA}
+
+    return identity(stored.generation_metadata) == identity(metadata)
 
 
 def add_if_new(
@@ -68,7 +96,11 @@ def add_if_new(
             "SELECT id FROM structures WHERE source = ? AND source_id = ?",
             (source, source_id),
         ).fetchone()
-    if own is not None:
+    if own is not None and _unchanged(db, own["id"], cif, energy_per_atom, metadata):
+        # The same file scored the same way again: nothing to write, so no
+        # shard reaches the writer.
+        sid, status, match = own["id"], UPDATED, None
+    elif own is not None:
         sid = own["id"]
         elements = sorted(stoichiometry)
         db.conn.execute(

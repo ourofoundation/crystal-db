@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 ase = pytest.importorskip("ase")
@@ -214,3 +216,25 @@ def test_read_cif_refuses_overlapping_atoms():
         read_cif(bad.to(fmt="cif"))
     with pytest.raises(InvalidStructure, match="empty"):
         read_cif(b"  ")
+
+
+def test_resubmitting_the_same_file_writes_nothing(tmp_path):
+    db = StructureDatabase(tmp_path / "work.db")
+    structure = b2("Fe", "Ni", 2.88)
+    meta = {"file_id": "f1", "name": "FeNi", "action_id": "run-1"}
+    first = add_if_new(db, structure, -7.1, source="ouro", source_id="f1", metadata=meta)
+    assert first.status == ADDED
+    since = datetime.now().isoformat()
+
+    # Same geometry and score, from another run: no change to send.
+    again = add_if_new(
+        db, structure, -7.1 + 1e-6, source="ouro", source_id="f1", metadata={**meta, "action_id": "run-2"}
+    )
+    assert (again.status, again.structure_id) == (UPDATED, first.structure_id)
+    assert db.export_changes(tmp_path / "delta.db", since) == 0
+
+    # A new score is stored.
+    add_if_new(db, structure, -7.2, source="ouro", source_id="f1", metadata=meta)
+    assert db.get_structure(first.structure_id).energy_per_atom == pytest.approx(-7.2)
+    assert db.export_changes(tmp_path / "delta.db", since) == 1
+    db.close()
