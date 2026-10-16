@@ -32,6 +32,9 @@ index.check(structure).status  # "known", "new polymorph" or "new composition"
 | `crystaldb.sources` | Source registry (published / generated / user) and readers for Materials Project and Alexandria |
 | `crystaldb.matching` | Novelty: is a structure already published? |
 | `crystaldb.references` | Fills near-hull reference energies on an MLIP surface |
+| `crystaldb.intake` | Adds a structure only if no stored structure matches it |
+| `crystaldb.stability` | Places a submitted structure on its system's hull: stores it if new, fills references, builds the hull |
+| `crystaldb.validation` | Reads submitted CIFs and refuses ones that can't be crystals |
 | `crystaldb.relaxation` | One batched ORB v3 relax recipe, plus single-points (torch-sim) |
 | `crystaldb.shared` | Snapshot readers, working copies and a single writer, for one file on a Modal Volume |
 
@@ -68,15 +71,26 @@ shared = SharedDatabase(volume, "/data/structures.db", writer=("my-app", "Writer
 
 The writer is a Modal class with `max_containers=1` whose `drain` method calls `shared.drain()`. Set `CRYSTALDB_WRITER_APP=none` to keep a deployment's writes out.
 
+## Hulls and adding structures
+
+```python
+from crystaldb.references import ase_energies
+from crystaldb.stability import assess
+
+result = assess(shared, structure, energy_per_atom, ase_energies(calculator),
+                surface=ORB_V3.id, source_id="my-file")
+result.hull.e_above_hull, result.intake.status  # "added", "updated" or "exists"
+```
+
+`intake.add_if_new` is the storing step on its own. Ouro's Crystal DB service exposes both as routes.
+
 ## Adding a generator
 
 Nothing needs registering. In a `working_copy([chemsys])`:
 
 1. Call `references.fill_near_hull(db, chemsys, energies)` so the MLIP hull has every phase near the PBE hull. For example, `energies = lambda s: relaxation.singlepoint(model, s)`.
 2. Relax candidates with `relaxation.relax`.
-3. Check each candidate with `db.novelty_index().check(structure)`:
-   - If it matches an existing structure, link that structure to the run instead of saving a copy.
-   - Otherwise save it with `add_structure(..., source="<model>")`.
+3. Save each candidate with `intake.add_if_new(db, structure, energy, source="<model>", run_id=...)`. A candidate that matches a stored structure is linked to the run instead of saved again.
 4. Build the hull with `compute_hull(..., include_generated_p1=False)`.
 
 ## Adding a published dataset

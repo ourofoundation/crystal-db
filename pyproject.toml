@@ -19,7 +19,7 @@ mp = ["mp-api>=0.45.8"]
 relax = ["torch-sim-atomistic>=0.6.0", "orb-models>=0.6.0", "ase>=3.22.0"]
 # Sharing one database between Modal apps (crystaldb.shared)
 modal = ["modal>=1.0"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ase>=3.22.0"]
 
 [project.urls]
 Repository = "https://github.com/ourofoundation/crystal-db"

@@ -5,7 +5,8 @@ at most 400 steps per structure. Structures of any composition and size share
 one GPU run; when the pool holds more atoms than ``BATCH_ATOMS`` they stream
 through an in-flight batch, each converged one swapped for a waiting one.
 
-``singlepoint`` scores structures as they are, in the same batched way:
+``evaluate`` and ``singlepoint`` score structures as they are, in the same
+batched way:
 how the shared database fills reference energies (``crystaldb.references``).
 
 This is the recipe Matra-Genoa and GenBench relax with. GenBench scores every
@@ -116,47 +117,71 @@ def _state(ts_model, structures: Sequence[Structure]):
     return atoms_list, state
 
 
-def singlepoint(
+@dataclass
+class Scored:
+    """A structure scored as given: total energy (eV) and max force (eV/Å)."""
+
+    energy: float
+    fmax: float
+
+
+def evaluate(
     ts_model, structures: Sequence[Structure], batch_atoms: int = SINGLEPOINT_BATCH_ATOMS
-) -> List[Optional[float]]:
-    """Total energy (eV) of each structure as given, in input order.
+) -> List[Optional[Scored]]:
+    """Energy and max force of each structure as given, in input order.
 
     Structures go through in batches of up to ``batch_atoms`` atoms; a batch
     that fails is retried one structure at a time, and a structure that
     still fails (or gives a non-finite energy) gets None.
     """
 
-    def energies(batch: Sequence[Structure]) -> List[Optional[float]]:
+    def run(batch: Sequence[Structure]) -> List[Optional[Scored]]:
         _, state = _state(ts_model, batch)
         output = ts_model(state)
         energy = output.get("energy")
         if energy is None:
             # ORB's conservative head reports its energy as "free_energy".
             energy = output["free_energy"]
-        values = energy.detach().cpu().numpy()
-        return [float(e) if np.isfinite(e) else None for e in values]
+        energies = energy.detach().cpu().numpy()
+        forces = output["forces"].detach().cpu().numpy()
+        out: List[Optional[Scored]] = []
+        start = 0
+        for structure, e in zip(batch, energies):
+            f = forces[start : start + len(structure)]
+            start += len(structure)
+            fmax = float(np.linalg.norm(f, axis=1).max()) if len(f) else 0.0
+            ok = np.isfinite(e) and np.isfinite(fmax)
+            out.append(Scored(float(e), fmax) if ok else None)
+        return out
 
-    def score(batch: Sequence[Structure]) -> List[Optional[float]]:
+    def score(batch: Sequence[Structure]) -> List[Optional[Scored]]:
         try:
-            return energies(batch)
+            return run(batch)
         except Exception:
             if len(batch) == 1:
                 return [None]
-            return [e for s in batch for e in score([s])]
+            return [r for s in batch for r in score([s])]
 
     order = sorted(range(len(structures)), key=lambda i: len(structures[i]))
-    out: List[Optional[float]] = [None] * len(structures)
+    out: List[Optional[Scored]] = [None] * len(structures)
     batch: List[int] = []
     atoms = 0
     for i in order + [None]:
         if batch and (i is None or atoms + len(structures[i]) > batch_atoms):
-            for j, e in zip(batch, score([structures[j] for j in batch])):
-                out[j] = e
+            for j, r in zip(batch, score([structures[j] for j in batch])):
+                out[j] = r
             batch, atoms = [], 0
         if i is not None:
             batch.append(i)
             atoms += len(structures[i])
     return out
+
+
+def singlepoint(
+    ts_model, structures: Sequence[Structure], batch_atoms: int = SINGLEPOINT_BATCH_ATOMS
+) -> List[Optional[float]]:
+    """Total energy (eV) of each structure as given, in input order; None on failure."""
+    return [r.energy if r else None for r in evaluate(ts_model, structures, batch_atoms)]
 
 
 def relax(ts_model, structures: Sequence[Structure]) -> List[Relaxed]:
