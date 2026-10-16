@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crystaldb"
+version = "0.1.0"
+description = "Crystal structure database with energies on several surfaces, MP2020-corrected hulls and novelty matching"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Matt Moderwell", email = "matt@ouro.foundation" }]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.20.0", "pymatgen>=2024.0.0"]
+
+[project.optional-dependencies]
+# Materials Project import (scripts/import.py --provider mp)
+mp = ["mp-api>=0.45.8"]
+# Batched ORB v3 relaxations and single-points (crystaldb.relaxation)
+relax = ["torch-sim-atomistic>=0.6.0", "orb-models>=0.6.0", "ase>=3.22.0"]
+# Sharing one database between Modal apps (crystaldb.shared)
+modal = ["modal>=1.0"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Repository = "https://github.com/ourofoundation/crystal-db"
+
+[tool.setuptools.packages.find]
+include = ["crystaldb*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
