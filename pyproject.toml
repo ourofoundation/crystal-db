@@ -17,8 +17,8 @@ dependencies = ["numpy>=1.20.0", "pymatgen>=2024.0.0"]
 mp = ["mp-api>=0.45.8"]
 # Batched ORB v3 relaxations and single-points (crystaldb.relaxation)
 relax = ["torch-sim-atomistic>=0.6.0", "orb-models>=0.6.0", "ase>=3.22.0"]
-# Sharing one database between Modal apps (crystaldb.shared)
-modal = ["modal>=1.0"]
+# Sharing the database as Ouro datasets (crystaldb.ouro)
+ouro = ["ouro-py>=2.9.0"]
 dev = ["pytest>=7.0", "ase>=3.22.0"]
 
 [project.urls]

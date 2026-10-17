@@ -1,4 +1,4 @@
-"""Keeping the shared database consistent: sources, merges, the inbox, imports."""
+"""Keeping the shared database consistent: sources, merges, imports."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pymatgen.core import Lattice, Structure
 from crystaldb.database import StructureDatabase
 from crystaldb.matching import KNOWN, NEW_COMPOSITION, REFERENCE
 from crystaldb.references import SINGLEPOINT_METADATA, fill_near_hull, missing_near_hull
-from crystaldb.shared import SharedDatabase
+from crystaldb.testing import FakeOuro
 from crystaldb.sources import is_generated, is_published
 from crystaldb.surfaces import ORB_V3, PBE, SOURCE_GEOMETRY
 
@@ -38,14 +38,6 @@ def add(db, structure, energy, source="ggen", **kwargs):
         source=source,
         **kwargs,
     )
-
-
-class Volume:
-    def reload(self):
-        pass
-
-    def commit(self):
-        pass
 
 
 # -------------------- Sources --------------------
@@ -76,17 +68,15 @@ def test_unregistered_sources_are_generated_never_prior_art(tmp_path):
 # -------------------- Merges never undo newer writes --------------------
 
 
-def test_shard_does_not_revert_a_newer_import(tmp_path):
-    main = StructureDatabase(tmp_path / "main.db")
-    fe = add(main, bcc("Fe"), -8.0, source="mp", source_id="mp-13", geometry_kind=SOURCE_GEOMETRY)
-    main.close()
-    shared = SharedDatabase(Volume(), tmp_path / "main.db")
+def test_a_working_copy_does_not_revert_a_newer_import(tmp_path):
+    fake = FakeOuro(tmp_path / "main.db")
+    fe = add(fake.db, bcc("Fe"), -8.0, source="mp", source_id="mp-13", geometry_kind=SOURCE_GEOMETRY)
+    store = fake.store()
 
-    sent = []
-    with shared.working_copy(["Fe"], ingest=sent.append) as work:
+    with store.working_copy(["Fe"]) as work:
         # While a worker holds its copy, an import refreshes the published
         # structure and retires it...
-        importer = StructureDatabase(tmp_path / "main.db", surface=PBE.id)
+        importer = StructureDatabase(fake.path, surface=PBE.id)
         importer.put_geometry(fe, SOURCE_GEOMETRY, bcc("Fe", 2.9).to(fmt="cif"))
         importer.conn.execute(
             "UPDATE structures SET is_valid = 0, updated_at = ? WHERE id = ?",
@@ -98,98 +88,24 @@ def test_shard_does_not_revert_a_newer_import(tmp_path):
         # ...then the worker adds an ORB energy for the reference.
         work.set_calculation(fe, -8.3, surface=ORB_V3.id, metadata=SINGLEPOINT_METADATA)
 
-    (tmp_path / "shard.db").write_bytes(sent[0])
-    main = StructureDatabase(tmp_path / "main.db")
-    main.merge_from(tmp_path / "shard.db", recompute_hulls=False)
+    main = StructureDatabase(fake.path)
     row = main.conn.execute("SELECT is_valid FROM structures WHERE id = ?", (fe,)).fetchone()
     assert row["is_valid"] == 0
     geometry = Structure.from_str(main.get_geometry(fe, SOURCE_GEOMETRY), fmt="cif")
     assert geometry.lattice.a == pytest.approx(2.9)
+    main.close()
+    main = StructureDatabase(fake.path, surface=ORB_V3.id)
     assert main.get_structure(fe).energy_per_atom == pytest.approx(-8.3)
     main.close()
 
 
-# -------------------- The writer's inbox --------------------
-
-
-def test_inbox_merges_queued_shards_in_one_copy(tmp_path, monkeypatch):
-    path = tmp_path / "data" / "ggen.db"
-    db = StructureDatabase(path)
-    add(db, bcc("Fe"), -8.0)
-    db.close()
-    shared = SharedDatabase(Volume(), path, writer=("app", "Writer"))
-    monkeypatch.setattr(SharedDatabase, "wake_writer", lambda self: "call-1")
-
-    for element in ("Co", "Ni"):
-        with shared.working_copy([element]) as work:
-            add(work, bcc(element), -7.0)
-    (shared.inbox / "00-broken.db").write_bytes(b"not a database")
-    assert len(list(shared.inbox.glob("*.db"))) == 3
-
-    copies = []
-    original = shared.exclusive_local_copy
-    monkeypatch.setattr(
-        shared, "exclusive_local_copy", lambda: copies.append(1) or original()
-    )
-    result = shared.drain()
-    assert result["shards"] == 2 and result["new_structures"] == 2
-    assert result["failed"] == ["00-broken.db"]
-    assert len(copies) == 1
-    assert not list(shared.inbox.glob("*.db"))
-    assert (shared.inbox / "failed" / "00-broken.db").exists()
-    with shared.reader() as reader:
-        assert {s.formula for s in reader.query_structures()} == {"Fe2", "Co2", "Ni2"}
-
-    # Nothing waiting: no copy at all.
-    assert shared.drain()["shards"] == 0
-    assert len(copies) == 1
-
-
-def test_shard_failing_partway_leaves_nothing_behind(tmp_path, monkeypatch):
-    path = tmp_path / "data" / "ggen.db"
-    StructureDatabase(path).close()
-    shared = SharedDatabase(Volume(), path, writer=("app", "Writer"))
-    monkeypatch.setattr(SharedDatabase, "wake_writer", lambda self: None)
-    for element in ("Co", "Ni"):
-        with shared.working_copy([element]) as work:
-            add(work, bcc(element), -7.0)
-    # The first shard's structures merge, then its calculations cannot.
-    first = sorted(shared.inbox.glob("*.db"))[0]
-    import sqlite3
-
-    conn = sqlite3.connect(first)
-    broken = conn.execute("SELECT formula FROM structures").fetchone()[0]
-    conn.execute("ALTER TABLE calculations DROP COLUMN run_type")
-    conn.commit()
-    conn.close()
-
-    result = shared.drain()
-    assert result["shards"] == 1 and len(result["failed"]) == 1
-    with shared.reader() as reader:
-        assert [s.formula for s in reader.query_structures()] == [
-            ({"Co2", "Ni2"} - {broken}).pop()
-        ]
-
-
-def test_writes_off_sends_nothing(tmp_path, monkeypatch):
-    path = tmp_path / "ggen.db"
-    StructureDatabase(path).close()
-    shared = SharedDatabase(Volume(), path, writer=("app", "Writer"))
-    monkeypatch.setenv("CRYSTALDB_WRITER_APP", "none")
-    with shared.working_copy(["Fe"]) as work:
-        add(work, bcc("Fe"), -8.0)
-    assert not shared.inbox.exists()
-
-
 def test_failed_send_does_not_fail_the_run(tmp_path):
-    path = tmp_path / "ggen.db"
-    StructureDatabase(path).close()
-    shared = SharedDatabase(Volume(), path)
+    store = FakeOuro(tmp_path / "main.db").store()
 
     def broken(shard):
-        raise RuntimeError("writer unreachable")
+        raise RuntimeError("Ouro unreachable")
 
-    with shared.working_copy(["Fe"], ingest=broken) as work:
+    with store.working_copy(["Fe"], ingest=broken) as work:
         add(work, bcc("Fe"), -8.0)
 
 

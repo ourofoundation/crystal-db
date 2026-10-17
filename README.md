@@ -12,7 +12,7 @@ It's the shared structure database behind [Ouro](https://ouro.foundation)'s mate
 
 ```bash
 pip install "crystaldb @ git+https://github.com/ourofoundation/crystal-db.git"
-# extras: [mp] Materials Project import, [relax] ORB v3 via torch-sim, [modal] sharing on a Modal Volume
+# extras: [mp] Materials Project import, [relax] ORB v3 via torch-sim, [ouro] sharing as Ouro datasets
 ```
 
 ```python
@@ -36,7 +36,8 @@ index.check(structure).status  # "known", "new polymorph" or "new composition"
 | `crystaldb.stability` | Places a submitted structure on its system's hull: stores it if new, fills references, builds the hull |
 | `crystaldb.validation` | Reads submitted CIFs and refuses ones that can't be crystals |
 | `crystaldb.relaxation` | One batched ORB v3 relax recipe, plus single-points (torch-sim) |
-| `crystaldb.shared` | Snapshot readers, working copies and a single writer, for one file on a Modal Volume |
+| `crystaldb.ouro` | The tables as Ouro datasets: working copies filled from them, changes upserted back |
+| `crystaldb.testing` | A fake of Ouro's dataset endpoints on SQLite, for tests |
 
 Scripts in `scripts/` maintain a database:
 
@@ -55,21 +56,21 @@ Scripts in `scripts/` maintain a database:
 - **Any other source** counts as generated: its structures are never prior art, and its P1 structures (mostly symmetry-broken leftovers) can be left out of hulls. A new generator can save structures under its own source name without a release of this package.
 - **`ouro`** marks user submissions.
 
-## Sharing one file between Modal apps
+## Sharing one database between apps
 
-A Modal Volume keeps the last commit of a file, so only one deployed writer may write the database.
+Ouro keeps the database as five datasets, one per table (structures, geometries, calculations, runs, run_structures), with the same columns and primary keys. Postgres takes concurrent writes, so any number of apps read and write it at once:
 
-Everyone else does one of two things:
-- **Reads a snapshot:** `SharedDatabase.reader()`.
-- **Works on a local copy:** `SharedDatabase.working_copy(systems)`. On exit, the copy's changes go as a shard file into `inbox/` beside the database, and the writer is woken.
-
-The writer's `drain` merges every waiting shard in one pass on a local copy of the file, and swaps it back in by rename. A merge only applies rows newer than what's stored: identity fields, geometries and calculations each carry their own `updated_at`. So a shard taken before an import can't undo the import.
+- **Read:** `store.reader(systems=[...])` or `store.reader(formulas=[...])` fills a local `StructureDatabase` with those structures, their geometries, calculations and runs.
+- **Write:** `store.working_copy(systems)` does the same; on exit, everything the copy changed is upserted back. A new structure the datasets already hold under another id (the same `(source, source_id)`, or for generated structures the same `structure_hash`) is merged into that row. A stored row's identity fields only change when the copy changed them and is newer, so a copy taken before an import can't undo it.
 
 ```python
-shared = SharedDatabase(volume, "/data/structures.db", writer=("my-app", "Writer"))
-```
+from ouro import Ouro
+from crystaldb.ouro import OuroSharedDatabase
 
-The writer is a Modal class with `max_containers=1` whose `drain` method calls `shared.drain()`. Set `CRYSTALDB_WRITER_APP=none` to keep a deployment's writes out.
+store = OuroSharedDatabase(Ouro(api_key=...), {"structures": "<dataset id>", "geometries": ..., ...})
+with store.working_copy(["Fe-Co"]) as db:
+    ...
+```
 
 ## Hulls and adding structures
 

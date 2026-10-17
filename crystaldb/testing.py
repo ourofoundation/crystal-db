@@ -1,0 +1,112 @@
+"""A stand-in for Ouro's dataset endpoints, for testing code that uses
+``crystaldb.ouro.OuroSharedDatabase`` without a server.
+
+``FakeOuro`` keeps the five tables in one SQLite file and answers the two
+endpoints the store uses the way the API does: read-only SQL returns rows
+with JSON columns parsed and flags as booleans, and upserts replace rows by
+primary key. ``fake.db`` is a ``StructureDatabase`` on that file, for
+setting up and inspecting what the server holds.
+
+    fake = FakeOuro(tmp_path / "server.db")
+    store = fake.store()
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import threading
+import uuid
+import zlib
+from pathlib import Path
+
+from .database import StructureDatabase
+from .ouro import BOOLEANS, JSON_COLUMNS, TABLES, OuroSharedDatabase
+
+
+class Response:
+    def __init__(self, body, status=200):
+        self.body, self.status_code, self.text = body, status, json.dumps(body)
+
+    def json(self):
+        return self.body
+
+
+class FakeOuro:
+    """Five 'datasets' as tables of one SQLite database."""
+
+    def __init__(self, path):
+        path = Path(path)
+        if path.is_dir():
+            path = path / "server.db"
+        self.path = path
+        self.db = StructureDatabase(path)
+        self.db.close()
+        # The store reads several things at once, so the server's connection
+        # is shared across threads under a lock.
+        self.server = sqlite3.connect(path, check_same_thread=False)
+        self.server.row_factory = sqlite3.Row
+        self.lock = threading.Lock()
+        self.db = StructureDatabase(path)
+        self.ids = {table: str(uuid.uuid4()) for table in TABLES}
+        self.names = {self.ids[table]: table for table in TABLES}
+        self.queries = 0
+        self.client = self
+
+    def get(self, path, **_):
+        dataset_id = path.rsplit("/", 1)[-1]
+        return Response({"data": {"metadata": {"table_name": f"dataset_{self.names[dataset_id]}"}}})
+
+    def post(self, path, json=None, **_):
+        with self.lock:
+            return self._post(path, json)
+
+    def _post(self, path, json):
+        if path.endswith("/query-custom"):
+            self.queries += 1
+            sql = re.sub(r'datasets\."dataset_(\w+)"', r"\1", json["query"])
+            rows = [dict(row) for row in self.server.execute(sql)]
+            return Response({"data": [self._as_api(row) for row in rows]})
+        table = self.names[path.split("/")[2]]
+        for row in json["rows"]:
+            columns = list(row)
+            values = [self._as_sqlite(column, row[column]) for column in columns]
+            self.server.execute(
+                f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                values,
+            )
+        self.server.commit()
+        return Response({"data": {"inserted": len(json["rows"])}})
+
+    @staticmethod
+    def _as_api(row):
+        out = {}
+        for column, value in row.items():
+            if value is None:
+                out[column] = None
+            elif column == "cif":
+                out[column] = zlib.decompress(value).decode() if isinstance(value, bytes) else value
+            elif column in BOOLEANS:
+                out[column] = bool(value)
+            elif column in JSON_COLUMNS:
+                out[column] = json.loads(value)
+            else:
+                out[column] = value
+        return out
+
+    @staticmethod
+    def _as_sqlite(column, value):
+        if value is None:
+            return None
+        if column == "cif":
+            return zlib.compress(value.encode(), 6)
+        if column in BOOLEANS:
+            return int(value)
+        if column in JSON_COLUMNS:
+            return json.dumps(value)
+        return value
+
+    def store(self) -> OuroSharedDatabase:
+        """An OuroSharedDatabase on this fake server."""
+        return OuroSharedDatabase(self, self.ids)

@@ -29,7 +29,7 @@ from .validation import space_group
 
 if TYPE_CHECKING:
     from .database import StructureDatabase
-    from .shared import SharedDatabase
+    from .ouro import OuroSharedDatabase
 
 INPUT_ENTRY_ID = "input_structure"
 # Most missing reference single-points done per call; the rest wait for the
@@ -166,7 +166,7 @@ def place_on_hull(
 
 
 def assess(
-    shared: "SharedDatabase",
+    shared: "OuroSharedDatabase",
     structure: Structure,
     energy_per_atom: float,
     energies: Energies,

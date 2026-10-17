@@ -15,27 +15,10 @@ from pymatgen.io.ase import AseAtomsAdaptor  # noqa: E402
 from crystaldb import StructureDatabase  # noqa: E402
 from crystaldb.intake import ADDED, EXISTS, UPDATED, add_if_new  # noqa: E402
 from crystaldb.references import ase_energies  # noqa: E402
-from crystaldb.shared import SharedDatabase  # noqa: E402
+from crystaldb.testing import FakeOuro  # noqa: E402
 from crystaldb.stability import HullError, assess  # noqa: E402
 from crystaldb.surfaces import ORB_V3, PBE, SOURCE_GEOMETRY  # noqa: E402
 from crystaldb.validation import InvalidStructure, read_cif  # noqa: E402
-
-
-class Volume:
-    def reload(self):
-        pass
-
-    def commit(self):
-        pass
-
-
-class LocalShared(SharedDatabase):
-    """Working copies merge straight back, standing in for the remote writer."""
-
-    def working_copy(self, chemical_systems, ingest=None, surface=None):
-        return super().working_copy(
-            chemical_systems, ingest=lambda shard: self.merge_shard(shard), surface=surface
-        )
 
 
 def fcc(element, a):
@@ -100,8 +83,9 @@ def add_stored(db, structure, energy, source, source_id=None, space_group_symbol
 
 @pytest.fixture
 def shared(tmp_path):
-    path = tmp_path / "shared.db"
-    db = StructureDatabase(path)
+    # The shared datasets, served by a fake Ouro on a local file.
+    fake = FakeOuro(tmp_path / "shared.db")
+    db = fake.db
     add_reference(db, "mp", "mp-30", fcc("Cu", 3.6), -3.7)
     add_reference(db, "mp", "mp-23", fcc("Ni", 3.52), -5.5)
     # Near the PBE hull (below the Cu-Ni tie line) and far above it.
@@ -110,8 +94,10 @@ def shared(tmp_path):
     # An earlier submission and a GGen structure.
     add_stored(db, b2("Cu", "Ni", 2.85), 0.2, "ouro", "file-earlier")
     add_stored(db, l12("Cu", "Ni", 3.6), 0.4, "ggen")
-    db.close()
-    return LocalShared(Volume(), path)
+    db._commit()
+    store = fake.store()
+    store.path = fake.path
+    return store
 
 
 def run(shared, structure, surface=ORB_V3.id, **kwargs):

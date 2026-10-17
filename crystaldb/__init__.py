@@ -3,8 +3,8 @@
 Reference structures (Materials Project, Alexandria), generator output and
 user submissions in one SQLite file, with raw energies per energy surface
 (PBE, MLIPs), MP2020 corrections on all of them, convex hulls, novelty
-matching against published data, and a single-writer layer for sharing the
-file between Modal apps.
+matching against published data. The same tables can live as Ouro
+datasets that many apps read and write at once (``crystaldb.ouro``).
 """
 
 from .database import ExplorationRun, StoredStructure, StructureDatabase
