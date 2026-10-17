@@ -36,7 +36,7 @@ index.check(structure).status  # "known", "new polymorph" or "new composition"
 | `crystaldb.stability` | Places a submitted structure on its system's hull: stores it if new, fills references, builds the hull |
 | `crystaldb.validation` | Reads submitted CIFs and refuses ones that can't be crystals |
 | `crystaldb.relaxation` | One batched ORB v3 relax recipe, plus single-points (torch-sim) |
-| `crystaldb.ouro` | The tables as Ouro datasets: working copies filled from them, changes upserted back |
+| `crystaldb.ouro` | The tables as Ouro datasets: working and bulk copies filled from them, changes sent back |
 | `crystaldb.testing` | A fake of Ouro's dataset endpoints on SQLite, for tests |
 
 Scripts in `scripts/` maintain a database:
@@ -61,7 +61,8 @@ Scripts in `scripts/` maintain a database:
 Ouro keeps the database as five datasets, one per table (structures, geometries, calculations, runs, run_structures), with the same columns and primary keys. Postgres takes concurrent writes, so any number of apps read and write it at once:
 
 - **Read:** `store.reader(systems=[...])` or `store.reader(formulas=[...])` fills a local `StructureDatabase` with those structures, their geometries, calculations and runs.
-- **Write:** `store.working_copy(systems)` does the same; on exit, everything the copy changed is upserted back. A new structure the datasets already hold under another id (the same `(source, source_id)`, or for generated structures the same `structure_hash`) is merged into that row. A stored row's identity fields only change when the copy changed them and is newer, so a copy taken before an import can't undo it.
+- **Write:** `store.working_copy(systems)` does the same; on exit, everything the copy changed is upserted back. A new structure the datasets already hold under another id (the same `(source, source_id)`, or for generated structures the same `structure_hash`) is merged into that row. A stored row's identity fields only change when the copy changed them and is newer, so a copy taken before an import can't undo it. Stored hull distances the copy recomputed go back as updates of the hull columns alone, so they never overwrite an energy written meanwhile.
+- **Whole-database jobs:** `store.bulk_copy(sources=[...])` copies every structure from those sources (every structure when none are named), read in parallel key ranges, optionally without geometries or with only some surfaces. The scripts in `scripts/` run on it unchanged, and its changes are sent when the block succeeds. Ouro's Crystal DB service runs them as its `maintenance` job.
 
 ```python
 from ouro import Ouro

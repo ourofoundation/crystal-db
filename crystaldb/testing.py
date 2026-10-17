@@ -3,8 +3,8 @@
 
 ``FakeOuro`` keeps the five tables in one SQLite file and answers the two
 endpoints the store uses the way the API does: read-only SQL returns rows
-with JSON columns parsed and flags as booleans, and upserts replace rows by
-primary key. ``fake.db`` is a ``StructureDatabase`` on that file, for
+with JSON columns parsed and flags as booleans, upserts replace rows by
+primary key, and updates set the given columns of rows matched by key. ``fake.db`` is a ``StructureDatabase`` on that file, for
 setting up and inspecting what the server holds.
 
     fake = FakeOuro(tmp_path / "server.db")
@@ -22,7 +22,7 @@ import zlib
 from pathlib import Path
 
 from .database import StructureDatabase
-from .ouro import BOOLEANS, JSON_COLUMNS, TABLES, OuroSharedDatabase
+from .ouro import BOOLEANS, JSON_COLUMNS, PRIMARY_KEYS, TABLES, OuroSharedDatabase
 
 
 class Response:
@@ -69,14 +69,28 @@ class FakeOuro:
             rows = [dict(row) for row in self.server.execute(sql)]
             return Response({"data": [self._as_api(row) for row in rows]})
         table = self.names[path.split("/")[2]]
+        key = PRIMARY_KEYS[table]
+        updated = 0
         for row in json["rows"]:
             columns = list(row)
             values = [self._as_sqlite(column, row[column]) for column in columns]
+            if json["mode"] == "update":
+                # Only the columns a row carries change; nothing is inserted.
+                sets = [column for column in columns if column not in key]
+                cursor = self.server.execute(
+                    f"UPDATE {table} SET {', '.join(f'{column} = ?' for column in sets)} "
+                    f"WHERE {' AND '.join(f'{column} = ?' for column in key)}",
+                    [values[columns.index(c)] for c in sets] + [values[columns.index(c)] for c in key],
+                )
+                updated += cursor.rowcount
+                continue
             self.server.execute(
                 f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
                 values,
             )
         self.server.commit()
+        if json["mode"] == "update":
+            return Response({"data": {"inserted": 0, "updated": updated}})
         return Response({"data": {"inserted": len(json["rows"])}})
 
     @staticmethod

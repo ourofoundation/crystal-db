@@ -160,3 +160,58 @@ def test_open_reader_removes_its_files_on_close(fake):
     assert db.get_structure_by_source("mp", "mp-13") is not None
     db.close()
     assert not os.path.exists(folder)
+
+
+@pytest.mark.parametrize("bulk_children", [0, 10**6])
+def test_bulk_copy_of_a_source(fake, monkeypatch, bulk_children):
+    import crystaldb.ouro as module
+
+    # Child rows by key range (0) or by lists of ids (a million).
+    monkeypatch.setattr(module, "BULK_CHILDREN", bulk_children)
+    monkeypatch.setattr(module, "PAGE_ROWS", 2)
+    store = OuroSharedDatabase(fake, fake.ids)
+    with store.bulk_copy(sources=["mp"]) as db:
+        count = lambda table: db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        assert count("structures") == 4 and count("geometries") == 4 and count("calculations") == 4
+        assert {row[0] for row in db.conn.execute("SELECT source FROM structures")} == {"mp"}
+    with store.bulk_copy(surfaces=[], geometries=False) as db:
+        assert db.conn.execute("SELECT count(*) FROM structures").fetchone()[0] == 5
+        assert db.conn.execute("SELECT count(*) FROM geometries").fetchone()[0] == 0
+        assert db.conn.execute("SELECT count(*) FROM calculations").fetchone()[0] == 0
+
+
+def test_hull_distances_go_back_as_patches(fake, monkeypatch):
+    import crystaldb.ouro as module
+
+    monkeypatch.setattr(module, "BULK_CHILDREN", 0)
+    store = OuroSharedDatabase(fake, fake.ids)
+    feco = fake.db.get_structure_by_source("mp", "mp-2090")
+    with store.bulk_copy(geometries=False) as db:
+        db.conn.execute("UPDATE calculations SET e_above_hull = 0.123, is_on_hull = 0, hull_computed_at = 'x'")
+        db._commit()
+        # Meanwhile a route writes a new energy for one of them.
+        fake.server.execute("UPDATE calculations SET energy_per_atom = -7.95 WHERE structure_id = ?", (feco.id,))
+        fake.server.commit()
+    rows = fake.server.execute("SELECT structure_id, energy_per_atom, e_above_hull, is_on_hull FROM calculations").fetchall()
+    assert len(rows) == 5 and all(row["e_above_hull"] == pytest.approx(0.123) and row["is_on_hull"] == 0 for row in rows)
+    # The patch carried the hull columns alone: the newer energy stays.
+    assert fake.db.get_structure(feco.id).energy_per_atom == pytest.approx(-7.95)
+
+
+def test_a_working_copy_sends_the_hulls_it_computes(fake):
+    store = OuroSharedDatabase(fake, fake.ids)
+    with store.working_copy(["Co-Fe"]) as db:
+        db.compute_hull("Co-Fe")
+    stored = fake.server.execute(
+        "SELECT count(*) FROM calculations WHERE hull_computed_at IS NOT NULL"
+    ).fetchone()[0]
+    assert stored == 4  # Fe, Co and both FeCo; Ni is not in the system
+
+
+def test_a_failed_bulk_job_sends_nothing(fake):
+    store = OuroSharedDatabase(fake, fake.ids)
+    with pytest.raises(RuntimeError):
+        with store.bulk_copy(sources=["mp"]) as db:
+            add(db, bcc("Ni", 2.9), -5.6, source="mp", source_id="mp-new")
+            raise RuntimeError("import failed")
+    assert fake.db.get_structure_by_source("mp", "mp-new") is None

@@ -139,7 +139,11 @@ def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[
                     rms_distance=rms,
                 )
             )
-    return sorted(matches, key=lambda m: m.rms_distance)
+    # Equally close matches (polymorph duplicates within float noise) keep a
+    # fixed order, whatever order the candidates were read in.
+    return sorted(
+        matches, key=lambda m: (round(m.rms_distance, 4), m.source_id or "", m.structure_id)
+    )
 
 
 @dataclass

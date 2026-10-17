@@ -12,6 +12,8 @@ upserted straight back.
         ...  # changes are upserted on exit
     with store.reader(formulas=["Fe3Co"]) as db:
         ...  # read only
+    with store.bulk_copy(sources=["mp"]) as db:
+        ...  # whole-database jobs: imports, stored hull distances
 
 ``ouro`` is an ``ouro.Ouro`` client (ouro-py) acting as a user who can
 read and write the datasets. Reads go through the datasets' read-only SQL
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import shutil
 import tempfile
 import time
@@ -55,6 +58,19 @@ ID_CHUNK = 1000
 FILL_REQUESTS = 6
 UPSERT_ROWS = 2000
 UPSERT_BYTES = 5_000_000
+UPSERT_REQUESTS = 4
+# A copy of a large part of the database (everything, or a whole source)
+# reads each table in this many key ranges, several at once. Once it holds
+# more structures than BULK_CHILDREN, its child rows come by key range too
+# (whole tables) instead of by lists of ids.
+KEY_RANGES = 16
+RANGE_REQUESTS = 8
+BULK_CHILDREN = 1_000_000
+BULK_CACHE_KIB = 2 * 1024 * 1024
+BULK_COMMIT_ROWS = 200_000
+# Stored hull distances: a copy sends changes to these alone as patches, so
+# recomputing hulls never rewrites a calculation's energy.
+HULL_COLUMNS = ("e_above_hull", "is_on_hull", "hull_computed_at")
 
 
 class OuroError(RuntimeError):
@@ -72,6 +88,7 @@ class OuroSharedDatabase:
         self._tables: Optional[Dict[str, str]] = None
         self._columns: Dict[str, List[str]] = {}
         self._counts: Optional[Tuple[float, Dict[str, Dict[str, Any]]]] = None
+        self._uncommitted = 0
 
     # -------------------- Requests --------------------
 
@@ -131,18 +148,74 @@ class OuroSharedDatabase:
             values = ", ".join(_literal(last[column]) for column in key)
             after = f" AND ({key_cols}) > ({values})"
 
+    def _ranged_pages(self, table: str, select: str, where: str) -> Iterator[List[Dict[str, Any]]]:
+        """Pages of a filtered table read in KEY_RANGES ranges of its first
+        key column (a uuid), several ranges at once; pages come in no
+        particular order."""
+        column = f"t.{PRIMARY_KEYS[table][0]}"
+        bounds = [None, *(f"{digit:x}0000000-0000-0000-0000-000000000000" for digit in range(1, KEY_RANGES)), None]
+        pages: "queue.Queue[Any]" = queue.Queue(maxsize=RANGE_REQUESTS * 2)
+        done = object()
+
+        def read(low: Optional[str], high: Optional[str]) -> None:
+            limits = [f"{column} >= {_literal(low)}"] if low else []
+            limits += [f"{column} < {_literal(high)}"] if high else []
+            ranged = " AND ".join([f"({where})", *limits])
+            try:
+                for rows in self._keyed_pages(table, select, ranged):
+                    pages.put(rows)
+            except BaseException as exc:
+                pages.put(exc)
+            finally:
+                pages.put(done)
+
+        with ThreadPoolExecutor(max_workers=RANGE_REQUESTS) as pool:
+            for low, high in zip(bounds, bounds[1:]):
+                pool.submit(read, low, high)
+            remaining = len(bounds) - 1
+            try:
+                while remaining:
+                    item = pages.get()
+                    if item is done:
+                        remaining -= 1
+                    elif isinstance(item, BaseException):
+                        raise item
+                    else:
+                        yield item
+            finally:
+                # Let readers still running finish without blocking.
+                while remaining:
+                    if pages.get() is done:
+                        remaining -= 1
+
     def upsert(self, table: str, rows: Sequence[Dict[str, Any]]) -> int:
-        """Insert or update rows by primary key, in batches."""
+        """Insert or replace whole rows by primary key, in batches."""
+        return self._write(table, rows, "upsert")
+
+    def update(self, table: str, rows: Sequence[Dict[str, Any]]) -> int:
+        """Set the columns each row carries on the stored row with its
+        primary key; keys that match nothing are skipped. Returns the number
+        of rows updated."""
+        return self._write(table, rows, "update")
+
+    def _write(self, table: str, rows: Sequence[Dict[str, Any]], mode: str) -> int:
         dataset_id = self.datasets[table]
-        sent = 0
-        for batch in _batches(rows):
-            self._request(
+        batches = list(_batches(rows))
+
+        def send(batch: List[Dict[str, Any]]) -> int:
+            data = self._request(
                 "post",
                 f"/datasets/{dataset_id}/data",
-                json={"mode": "upsert", "rows": batch, "finalize": False},
+                json={"mode": mode, "rows": batch, "finalize": False},
             )
-            sent += len(batch)
-        return sent
+            if mode == "update" and isinstance(data, dict):
+                return int(data.get("updated", 0))
+            return len(batch)
+
+        if len(batches) <= 1:
+            return sum(send(batch) for batch in batches)
+        with ThreadPoolExecutor(max_workers=UPSERT_REQUESTS) as pool:
+            return sum(pool.map(send, batches))
 
     # -------------------- Reading into a local copy --------------------
 
@@ -153,12 +226,18 @@ class OuroSharedDatabase:
         systems: Iterable[str] = (),
         formulas: Iterable[str] = (),
         structure_ids: Iterable[str] = (),
+        sources: Iterable[str] = (),
+        everything: bool = False,
         surface: Optional[str] = None,
+        surfaces: Optional[Iterable[str]] = None,
+        geometries: bool = True,
     ) -> Tuple[StructureDatabase, Dict[str, str]]:
         """A local StructureDatabase holding the structures selected by
-        chemical system (with subsystems), reduced formula or id, with their
-        geometries, calculations and runs. Returns it and the ``updated_at``
-        of each structure it holds, by id."""
+        chemical system (with subsystems), reduced formula, id or source (or
+        every structure), with their geometries, calculations and runs.
+        ``surfaces`` limits the calculations to those surfaces, and
+        ``geometries=False`` leaves geometries out (hulls need neither).
+        Returns it and the ``updated_at`` of each structure it holds, by id."""
         subsystems = sorted(
             {
                 sub
@@ -177,40 +256,89 @@ class OuroSharedDatabase:
         ids = sorted(set(structure_ids))
         for chunk in _chunks(ids, ID_CHUNK):
             conditions.append(f"t.id IN ({_literals(chunk)})")
+        sources = sorted(set(sources))
+        if sources:
+            conditions.append(f"t.source IN ({_literals(sources)})")
+        if everything:
+            conditions = ["TRUE"]
+        # Only a copy of whole sources (or everything) reads by key range.
+        bulk = everything or (bool(sources) and len(conditions) == 1)
         db = StructureDatabase(out_path, surface=surface or DEFAULT_SURFACE)
         if not conditions:
+            _snapshot_hulls(db)
             return db, {}
 
         started = time.time()
         held: Dict[str, str] = {}
-        for rows in self._keyed_pages("structures", "t.*", " OR ".join(conditions)):
-            self._insert(db, "structures", rows)
+        where = " OR ".join(conditions)
+        pages = self._ranged_pages if bulk else self._keyed_pages
+        # Millions of rows arrive in random key order: load them without the
+        # secondary indexes, in a big cache, committing as they come, and
+        # build the indexes once at the end.
+        indexes = _drop_indexes(db) if bulk else []
+        if bulk:
+            db.conn.execute(f"PRAGMA cache_size=-{BULK_CACHE_KIB}")
+        for rows in pages("structures", "t.*", where):
+            self._insert(db, "structures", rows, commit=bulk)
             held.update((row["id"], row["updated_at"]) for row in rows)
         counts = {"structures": len(held)}
-        # Children by chunks of ids (primary key lookups), several requests
-        # at once; rows go into the local copy as each answer arrives.
-        tasks = [
-            (table, f"SELECT * FROM {self.table(table)} WHERE structure_id IN ({_literals(chunk)})")
-            for table in ("geometries", "calculations", "run_structures")
-            for chunk in _chunks(list(held), ID_CHUNK)
-        ]
-        with ThreadPoolExecutor(max_workers=FILL_REQUESTS) as pool:
-            futures = {pool.submit(self.query, sql): table for table, sql in tasks}
-            for future in as_completed(futures):
-                table, rows = futures[future], future.result()
-                counts[table] = counts.get(table, 0) + len(rows)
-                if rows:
-                    self._insert(db, table, rows)
+        children = {"calculations": "TRUE", "run_structures": "TRUE"}
+        if geometries:
+            children["geometries"] = "TRUE"
+        if surfaces is not None:
+            children["calculations"] = f"t.surface IN ({_literals(sorted(set(surfaces))) or 'NULL'})"
+        if bulk and len(held) > BULK_CHILDREN:
+            # Most of the database: read the child tables whole by key range
+            # (filtering by source on the server costs a join per page), then
+            # drop the rows of structures the copy does not hold.
+            for table, filter in children.items():
+                for rows in self._ranged_pages(table, "t.*", filter):
+                    self._insert(db, table, rows, commit=True)
+                if not everything:
+                    db.conn.execute(f"DELETE FROM {table} WHERE structure_id NOT IN (SELECT id FROM structures)")
+                counts[table] = db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        else:
+            # Children by chunks of ids (primary key lookups), several
+            # requests at once; rows go into the copy as each answer arrives.
+            tasks = [
+                (
+                    table,
+                    f"SELECT * FROM {self.table(table)} t "
+                    f"WHERE t.structure_id IN ({_literals(chunk)}) AND {filter}",
+                )
+                for table, filter in children.items()
+                for chunk in _chunks(list(held), ID_CHUNK)
+            ]
+            with ThreadPoolExecutor(max_workers=FILL_REQUESTS) as pool:
+                futures = {pool.submit(self.query, sql): table for table, sql in tasks}
+                for future in as_completed(futures):
+                    table, rows = futures[future], future.result()
+                    counts[table] = counts.get(table, 0) + len(rows)
+                    if rows:
+                        self._insert(db, table, rows, commit=bulk)
         run_ids = [row[0] for row in db.conn.execute("SELECT DISTINCT run_id FROM run_structures")]
         for chunk in _chunks(run_ids, ID_CHUNK):
             rows = self.query(f"SELECT * FROM {self.table('runs')} WHERE id IN ({_literals(chunk)})")
             if rows:
                 self._insert(db, "runs", rows)
         db._commit()
+        if indexes:
+            indexing = time.time()
+            for sql in indexes:
+                db.conn.execute(sql)
+            db.conn.execute("PRAGMA cache_size=-131072")
+            db._commit()
+            logger.info("Built %d indexes in %.1f s", len(indexes), time.time() - indexing)
+        _snapshot_hulls(db)
+        db._commit()
         logger.info("Filled %s in %.1f s", counts, time.time() - started)
         return db, held
 
-    def _insert(self, db: StructureDatabase, table: str, rows: List[Dict[str, Any]]) -> None:
+    def _insert(
+        self, db: StructureDatabase, table: str, rows: List[Dict[str, Any]], commit: bool = False
+    ) -> None:
+        """Rows into the copy; ``commit`` commits every BULK_COMMIT_ROWS rows,
+        so a big fill never holds one huge transaction."""
         if table not in self._columns:
             self._columns[table] = db._table_columns(table)
         columns = [column for column in self._columns[table] if column in rows[0]]
@@ -219,6 +347,11 @@ class OuroSharedDatabase:
             f"VALUES ({', '.join('?' * len(columns))})",
             ([_to_sqlite(column, row.get(column)) for column in columns] for row in rows),
         )
+        if commit:
+            self._uncommitted += len(rows)
+            if self._uncommitted >= BULK_COMMIT_ROWS:
+                db._commit()
+                self._uncommitted = 0
 
     def open_reader(
         self,
@@ -300,24 +433,80 @@ class OuroSharedDatabase:
             try:
                 yield db
             finally:
-                delta_path = Path(tmp) / "delta.db"
-                changed = db.export_changes(delta_path, since)
+                # A run that finished must not fail because its results
+                # could not be saved for later runs.
+                try:
+                    self._send_changes(db, held, since, ingest)
+                except Exception:
+                    logger.exception("Could not send the copy's changes")
+
+    @contextmanager
+    def bulk_copy(
+        self,
+        *,
+        sources: Iterable[str] = (),
+        surfaces: Optional[Iterable[str]] = None,
+        geometries: bool = True,
+        surface: Optional[str] = None,
+    ) -> Iterator[StructureDatabase]:
+        """A writable local copy of every structure from ``sources`` (every
+        structure when none are named), for whole-database jobs: imports and
+        stored hull distances. ``surfaces`` and ``geometries`` leave out what
+        the job does not read (see ``_fill``). Changes are sent when the
+        block succeeds, and a failure to send them raises.
+        """
+        sources = list(sources)
+        with tempfile.TemporaryDirectory(prefix="crystaldb-bulk-") as tmp:
+            since = datetime.now().isoformat()
+            db, held = self._fill(
+                Path(tmp) / "work.db",
+                sources=sources,
+                everything=not sources,
+                surfaces=surfaces,
+                geometries=geometries,
+                surface=surface,
+            )
+            try:
+                yield db
+            except BaseException:
                 db.close()
-                if changed:
-                    # A run that finished must not fail because its results
-                    # could not be saved for later runs.
-                    try:
-                        sending = time.time()
-                        if ingest is not None:
-                            result = ingest(delta_path.read_bytes())
-                        else:
-                            result = self.push(delta_path, filled=held)
-                        logger.info(
-                            "Sent %d changed structures in %.1f s: %s",
-                            changed, time.time() - sending, result,
-                        )
-                    except Exception:
-                        logger.exception("Could not send %d changed structures", changed)
+                raise
+            self._send_changes(db, held, since)
+
+    def _send_changes(
+        self,
+        db: StructureDatabase,
+        held: Dict[str, str],
+        since: str,
+        ingest: Optional[Callable[[bytes], dict]] = None,
+    ) -> Dict[str, Any]:
+        """Send what changed in a filled copy since ``since``, and close it.
+
+        New and changed rows go through ``push``; stored hull distances that
+        changed on calculations the copy did not otherwise change go as
+        patches of the hull columns alone. ``ingest`` takes the changes as a
+        SQLite file's bytes instead (tests and dry runs; patches are counted,
+        not sent).
+        """
+        delta_path = db.db_path.parent / "delta.db"
+        try:
+            changed = db.export_changes(delta_path, since)
+            patches = _hull_patches(db, since)
+        finally:
+            db.close()
+        if not changed and not patches:
+            return {}
+        sending = time.time()
+        result: Dict[str, Any] = {}
+        if changed:
+            result = ingest(delta_path.read_bytes()) if ingest is not None else self.push(delta_path, filled=held)
+        if patches:
+            result["hull_patches"] = len(patches) if ingest is not None else self.update("calculations", patches)
+        logger.info(
+            "Sent %d changed structures and %d hull distances in %.1f s: %s",
+            changed, len(patches), time.time() - sending, result,
+        )
+        return result
 
     # -------------------- Writing changes back --------------------
 
@@ -443,6 +632,48 @@ class OuroSharedDatabase:
         counts = {row["source"]: {"structures": row["n"], "imported_at": None} for row in rows}
         self._counts = (time.time(), counts)
         return counts
+
+
+# -------------------- Hull distances --------------------
+
+
+def _drop_indexes(db: StructureDatabase) -> List[str]:
+    """Drop a copy's secondary indexes; returns the statements that build
+    them again."""
+    rows = db.conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL"
+    ).fetchall()
+    for name, _ in rows:
+        db.conn.execute(f'DROP INDEX "{name}"')
+    db._commit()
+    return [sql for _, sql in rows]
+
+
+def _snapshot_hulls(db: StructureDatabase) -> None:
+    """Keep the stored hull distances a copy was filled with, to tell later
+    which ones a job changed."""
+    columns = ", ".join(HULL_COLUMNS)
+    db.conn.execute("DROP TABLE IF EXISTS _filled_hulls")
+    db.conn.execute(
+        f"CREATE TABLE _filled_hulls AS SELECT structure_id, surface, {columns} FROM calculations"
+    )
+    db._commit()
+
+
+def _hull_patches(db: StructureDatabase, since: str) -> List[Dict[str, Any]]:
+    """Hull distances changed on calculations not otherwise changed since
+    ``since`` (those go whole, with the copy's other changes)."""
+    changed = " OR ".join(f"c.{column} IS NOT f.{column}" for column in HULL_COLUMNS)
+    rows = db.conn.execute(
+        f"""
+        SELECT c.structure_id, c.surface, {', '.join(f'c.{column}' for column in HULL_COLUMNS)}
+        FROM calculations c
+        JOIN _filled_hulls f ON f.structure_id = c.structure_id AND f.surface = c.surface
+        WHERE c.updated_at < ? AND ({changed})
+        """,
+        (since,),
+    )
+    return [_to_ouro("calculations", dict(row)) for row in rows]
 
 
 # -------------------- Value conversion --------------------
