@@ -6,6 +6,10 @@ returned instead of a second copy; the database only grows by new crystals.
 A structure resubmitted under the same ``(source, source_id)``, such as a
 user's file that was replaced, updates its own row.
 
+Generators store a run's relaxed structures with ``add_unique``: copies of
+one crystal within the run collapse to the lowest in energy first, then
+each goes through ``add_if_new``.
+
 The energy given is the structure's raw energy on the database's surface,
 on the given geometry (relaxed on that surface).
 """
@@ -14,7 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from pymatgen.core import Structure
 
@@ -33,6 +37,9 @@ EXISTS = "exists"
 SAME_ENERGY_EV = 1e-4
 # Metadata that names the run, not the structure.
 RUN_METADATA = ("action_id",)
+# Relaxed structures within this energy (eV/atom) of each other are compared
+# as possible copies of one crystal.
+DUPLICATE_WINDOW_EV = 0.01
 
 
 @dataclass
@@ -167,3 +174,75 @@ def add_if_new(
         db.link_structure_to_run(run_id, sid)
     db._commit()
     return Intake(status=status, structure_id=sid, match=match, novelty=novelty, changed=changed)
+
+
+@dataclass
+class Generated:
+    """A relaxed structure a generator wants stored."""
+
+    structure: Structure
+    # Raw energy per atom on the database's surface, on this geometry.
+    energy_per_atom: float
+    metadata: Optional[Dict[str, Any]] = None
+    # An unconverged relaxation's energy is not final.
+    converged: bool = True
+
+
+def collapse(items: Sequence[Generated]) -> List[Tuple[Generated, int]]:
+    """One representative per distinct crystal among structures of one
+    reduced formula, with how many copies it stands for. Representatives
+    are the lowest in energy of their copies, converged ones first."""
+    from .matching import primitive, rms_distance
+
+    reps: List[List[Any]] = []  # [item, primitive cell, copies]
+    for item in sorted(items, key=lambda g: g.energy_per_atom):
+        cell = primitive(item.structure)
+        for rep in reps:
+            if (
+                item.energy_per_atom - rep[0].energy_per_atom <= DUPLICATE_WINDOW_EV
+                and rms_distance(rep[1], cell) is not None
+            ):
+                rep[2] += 1
+                break
+        else:
+            reps.append([item, cell, 1])
+    reps.sort(key=lambda rep: (not rep[0].converged, rep[0].energy_per_atom))
+    return [(item, copies) for item, _, copies in reps]
+
+
+def add_unique(
+    db: "StructureDatabase",
+    items: Sequence[Generated],
+    *,
+    source: str,
+    run_id: Optional[str] = None,
+    keep: Optional[int] = None,
+) -> List[Tuple[Generated, int, Intake]]:
+    """Store a generator's relaxed structures, each distinct crystal once.
+
+    They are grouped by reduced formula and collapsed (``collapse``); each
+    representative goes through ``add_if_new``, so one equal to a stored
+    structure (published, or from any earlier run) is linked to ``run_id``
+    instead of stored again. ``keep`` limits each formula to its lowest
+    converged representatives. Returns (representative, copies, intake).
+    """
+    groups: Dict[str, List[Generated]] = {}
+    for item in items:
+        groups.setdefault(item.structure.composition.reduced_formula, []).append(item)
+    out: List[Tuple[Generated, int, Intake]] = []
+    for group in groups.values():
+        reps = collapse(group)
+        if keep is not None:
+            reps = [rep for rep in reps if rep[0].converged][:keep]
+        for item, copies in reps:
+            intake = add_if_new(
+                db,
+                item.structure,
+                item.energy_per_atom,
+                source=source,
+                metadata={**(item.metadata or {}), "copies": copies},
+                run_id=run_id,
+            )
+            out.append((item, copies, intake))
+    return out
+

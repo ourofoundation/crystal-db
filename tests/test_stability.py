@@ -13,7 +13,7 @@ from pymatgen.core import Lattice, Structure  # noqa: E402
 from pymatgen.io.ase import AseAtomsAdaptor  # noqa: E402
 
 from crystaldb import StructureDatabase  # noqa: E402
-from crystaldb.intake import ADDED, EXISTS, UPDATED, add_if_new  # noqa: E402
+from crystaldb.intake import ADDED, EXISTS, UPDATED, Generated, add_if_new, add_unique  # noqa: E402
 from crystaldb.references import ase_energies  # noqa: E402
 from crystaldb.testing import FakeOuro  # noqa: E402
 from crystaldb.stability import HullError, assess  # noqa: E402
@@ -223,4 +223,44 @@ def test_resubmitting_the_same_file_writes_nothing(tmp_path):
     add_if_new(db, structure, -7.2, source="ouro", source_id="f1", metadata=meta)
     assert db.get_structure(first.structure_id).energy_per_atom == pytest.approx(-7.2)
     assert db.export_changes(tmp_path / "delta.db", since) == 1
+    db.close()
+
+
+def test_add_unique_stores_each_crystal_once(tmp_path):
+    db = StructureDatabase(tmp_path / "work.db")
+    published = add_reference(db, "mp", "mp-2213", b2("Fe", "Ni", 2.86), -7.0)
+    run_id = db.create_run("Fe-Ni")
+    items = [
+        # Three relaxations of one L1_0 crystal (a cell twice the size, too),
+        # and one of the published B2.
+        Generated(l10("Fe", "Ni"), -6.9001),
+        Generated(l10("Fe", "Ni"), -6.9),
+        Generated(l10("Fe", "Ni") * (1, 1, 2), -6.8999),
+        Generated(b2("Fe", "Ni", 2.88), -7.1),
+    ]
+    out = add_unique(db, items, source="ggen", run_id=run_id)
+    stored = {(intake.status, copies, item.energy_per_atom) for item, copies, intake in out}
+    assert stored == {(ADDED, 3, -6.9001), (EXISTS, 1, -7.1)}
+    ggen = db.conn.execute("SELECT id FROM structures WHERE source = 'ggen'").fetchall()
+    assert len(ggen) == 1
+    linked = {r[0] for r in db.conn.execute("SELECT structure_id FROM run_structures")}
+    assert linked == {published, ggen[0][0]}
+
+    # A later run's copy of the stored crystal is linked, not stored again.
+    again = add_unique(db, [Generated(l10("Fe", "Ni"), -6.95)], source="ggen", run_id=db.create_run("Fe-Ni"))
+    assert again[0][2].status == EXISTS
+    assert db.conn.execute("SELECT count(*) FROM structures WHERE source = 'ggen'").fetchone()[0] == 1
+    db.close()
+
+
+def test_add_unique_keeps_the_lowest_converged(tmp_path):
+    db = StructureDatabase(tmp_path / "work.db")
+    items = [
+        Generated(l10("Fe", "Ni"), -6.9, converged=False),
+        Generated(b2("Fe", "Ni", 2.88), -7.1),
+        Generated(fcc("Ni", 3.52), -4.4),
+    ]
+    out = add_unique(db, items, source="ggen", keep=1)
+    assert sorted(item.structure.composition.reduced_formula for item, _, _ in out) == ["FeNi", "Ni"]
+    assert all(item.converged for item, _, _ in out)
     db.close()

@@ -99,6 +99,7 @@ class OuroSharedDatabase:
         self._counts: Optional[Tuple[float, Dict[str, Dict[str, Any]]]] = None
         self._uncommitted = 0
         self._slots = threading.BoundedSemaphore(MAX_REQUESTS)
+        self._counting = threading.Lock()
 
     # -------------------- Requests --------------------
 
@@ -118,10 +119,14 @@ class OuroSharedDatabase:
     def tables(self) -> Dict[str, str]:
         """Postgres table name of each dataset (``datasets."dataset_<id>"``)."""
         if self._tables is None:
-            self._tables = {
-                table: self._request("get", f"/datasets/{dataset_id}")["metadata"]["table_name"]
-                for table, dataset_id in self.datasets.items()
-            }
+            # One lookup per dataset, all at once: a new container's first
+            # copy waits on these.
+            with ThreadPoolExecutor(max_workers=len(self.datasets)) as pool:
+                names = pool.map(
+                    lambda dataset_id: self._request("get", f"/datasets/{dataset_id}")["metadata"]["table_name"],
+                    self.datasets.values(),
+                )
+                self._tables = dict(zip(self.datasets, names))
         return self._tables
 
     def table(self, name: str) -> str:
@@ -731,10 +736,15 @@ class OuroSharedDatabase:
     def source_counts(self, max_age: float = 3600.0) -> Dict[str, Dict[str, Any]]:
         """Valid structures per source, in the shape of
         ``StructureDatabase.source_counts`` (no import times). Counting reads
-        the whole table, so a count is reused for ``max_age`` seconds."""
-        cached = self._counts
-        if cached is not None and time.time() - cached[0] < max_age:
-            return cached[1]
+        the whole table, so a count is reused for ``max_age`` seconds, and a
+        caller arriving while one runs waits for it."""
+        with self._counting:
+            cached = self._counts
+            if cached is not None and time.time() - cached[0] < max_age:
+                return cached[1]
+            return self._count_sources()
+
+    def _count_sources(self) -> Dict[str, Dict[str, Any]]:
         rows = self.query(
             f"SELECT source, count(*) AS n FROM {self.table('structures')} "
             f"WHERE is_valid GROUP BY source"
