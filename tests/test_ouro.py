@@ -296,3 +296,21 @@ def test_a_run_of_known_structures_still_sends_its_links(fake):
     assert fake.server.execute("SELECT count(*) FROM runs WHERE id = ?", (run_id,)).fetchone()[0] == 1
     links = fake.server.execute("SELECT structure_id FROM run_structures WHERE run_id = ?", (run_id,)).fetchall()
     assert [row[0] for row in links] == [feco.id]
+
+
+def test_deletes_by_a_single_key_go_in_small_requests(fake, monkeypatch):
+    import crystaldb.ouro as module
+
+    store = OuroSharedDatabase(fake, fake.ids)
+    sizes = []
+    request = fake.request
+
+    def counting(method, path, json=None, **kwargs):
+        sizes.append(len(json["ids"]))
+        return request(method, path, json=json, **kwargs)
+
+    monkeypatch.setattr(fake, "request", counting)
+    monkeypatch.setattr(module, "DELETE_IDS", 2)
+    ids = [{"id": row[0]} for row in fake.server.execute("SELECT id FROM structures WHERE source = 'mp'")]
+    assert store.delete("structures", ids) == 4
+    assert sorted(sizes) == [2, 2]

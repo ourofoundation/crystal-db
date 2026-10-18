@@ -61,8 +61,11 @@ MAX_REQUESTS = 12
 UPSERT_ROWS = 2000
 UPSERT_BYTES = 5_000_000
 UPSERT_REQUESTS = 4
-# Keys per delete request (the API's limit).
+# Keys per delete request: the API takes at most 1,000, and for a
+# single-column key it filters by them in the query string, which ~150
+# uuids already fill.
 DELETE_KEYS = 1000
+DELETE_IDS = 150
 # A copy of a large part of the database (everything, or a whole source)
 # reads each table in this many key ranges, several at once. Once it holds
 # more structures than BULK_CHILDREN, its child rows come by key range too
@@ -250,7 +253,7 @@ class OuroSharedDatabase:
             data = self._request("delete", f"/datasets/{dataset_id}/rows", json={"ids": list(chunk)})
             return int((data or {}).get("deleted", 0))
 
-        chunks = list(_chunks(ids, DELETE_KEYS))
+        chunks = list(_chunks(ids, DELETE_IDS if len(key) == 1 else DELETE_KEYS))
         if len(chunks) <= 1:
             return sum(send(chunk) for chunk in chunks)
         with ThreadPoolExecutor(max_workers=UPSERT_REQUESTS) as pool:
