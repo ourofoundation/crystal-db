@@ -314,3 +314,26 @@ def test_deletes_by_a_single_key_go_in_small_requests(fake, monkeypatch):
     ids = [{"id": row[0]} for row in fake.server.execute("SELECT id FROM structures WHERE source = 'mp'")]
     assert store.delete("structures", ids) == 4
     assert sorted(sizes) == [2, 2]
+
+
+def test_gateway_errors_are_retried(fake, monkeypatch):
+    import crystaldb.ouro as module
+    from crystaldb.testing import Response
+
+    monkeypatch.setattr(module, "RETRY_SECONDS", (0, 0))
+    store = OuroSharedDatabase(fake, fake.ids)
+    post = fake.post
+    failures = [502, 503]
+
+    def flaky(path, json=None, **kwargs):
+        if failures:
+            return Response({"error": {"message": "<html>Bad gateway</html>"}}, failures.pop(0))
+        return post(path, json=json, **kwargs)
+
+    monkeypatch.setattr(fake, "post", flaky)
+    assert store.query(f"SELECT count(*) AS n FROM {store.table('structures')}") == [{"n": 5}]
+
+    # A failure that persists still raises.
+    failures[:] = [502, 502, 502]
+    with pytest.raises(module.OuroError, match="502"):
+        store.query(f"SELECT count(*) AS n FROM {store.table('structures')}")

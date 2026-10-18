@@ -61,6 +61,9 @@ MAX_REQUESTS = 12
 UPSERT_ROWS = 2000
 UPSERT_BYTES = 5_000_000
 UPSERT_REQUESTS = 4
+# Transient failures retried, and the waits between tries (s).
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_SECONDS = (1.0, 3.0, 8.0)
 # Keys per delete request. The API takes at most 1,000 and a JSON body of
 # at most 100 kB (a two-uuid key is ~100 bytes), and filters a single-column
 # key by the ids in the query string, which ~150 uuids already fill.
@@ -82,6 +85,17 @@ HULL_COLUMNS = ("e_above_hull", "is_on_hull", "hull_computed_at")
 
 class OuroError(RuntimeError):
     """A request to Ouro failed."""
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """A dropped connection or timeout from ouro-py (or httpx below it)."""
+    try:
+        from ouro import APIConnectionError
+    except ImportError:  # pragma: no cover
+        APIConnectionError = ()
+    import httpx
+
+    return isinstance(exc, (APIConnectionError, httpx.TransportError))
 
 
 def stored_id(db: StructureDatabase, structure_id: str) -> str:
@@ -109,11 +123,25 @@ class OuroSharedDatabase:
     # -------------------- Requests --------------------
 
     def _request(self, method: str, path: str, **kwargs) -> Any:
-        if method == "delete":
-            # A DELETE with a body goes through the client's generic request.
-            response = self.ouro.client.request("DELETE", path, **kwargs)
-        else:
-            response = getattr(self.ouro.client, method)(path, **kwargs)
+        # Every call the store makes (reads, upserts and updates by key,
+        # deletes by key) can safely run twice, so a gateway error or a
+        # dropped connection is retried a few times before it fails a run.
+        for attempt in range(len(RETRY_SECONDS) + 1):
+            try:
+                if method == "delete":
+                    # A DELETE with a body goes through the client's generic request.
+                    response = self.ouro.client.request("DELETE", path, **kwargs)
+                else:
+                    response = getattr(self.ouro.client, method)(path, **kwargs)
+            except Exception as exc:
+                if attempt == len(RETRY_SECONDS) or not _is_connection_error(exc):
+                    raise
+                logger.info("Retrying %s %s after %s", method.upper(), path, exc)
+            else:
+                if response.status_code not in RETRY_STATUSES or attempt == len(RETRY_SECONDS):
+                    break
+                logger.info("Retrying %s %s after %d", method.upper(), path, response.status_code)
+            time.sleep(RETRY_SECONDS[attempt])
         try:
             body = response.json()
         except ValueError:
