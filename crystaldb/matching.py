@@ -50,10 +50,18 @@ def _matcher():
 
 
 def primitive(structure: Structure) -> Structure:
+    """``structure``'s primitive cell, Niggli-reduced the way the matcher
+    would reduce it, so ``rms_distance`` can skip that step: the matcher's
+    own reduction goes through a cache keyed by structure equality, which
+    cost most of the time of matching formulas with hundreds of structures."""
     try:
-        return structure.get_primitive_structure()
+        cell = structure.get_primitive_structure()
     except Exception:
-        return structure
+        cell = structure
+    try:
+        return _matcher()._get_reduced_structure(cell, primitive_cell=False, niggli=True)
+    except Exception:
+        return cell
 
 
 @lru_cache(maxsize=PRIMITIVE_CACHE_SIZE)
@@ -71,11 +79,16 @@ def primitive_from_cif(cif: str) -> Optional[Structure]:
 
 
 def rms_distance(a: Structure, b: Structure) -> Optional[float]:
-    """Normalized RMS displacement if two primitive structures match, else None."""
+    """Normalized RMS displacement if two cells from ``primitive`` match, else None."""
     if len(a) != len(b):
         return None
     try:
-        result = _matcher().get_rms_dist(a, b)
+        # get_rms_dist, without reducing cells primitive() reduced already.
+        matcher = _matcher()
+        s1, s2 = matcher._process_species([a, b])
+        s1, s2, fu, s1_supercell = matcher._preprocess(s1, s2, skip_structure_reduction=True)
+        match = matcher._match(s1, s2, fu, s1_supercell, use_rms=True, break_on_match=False)
+        result = None if match is None else (match[0], max(match[1]))
     except Exception as exc:
         logger.debug("Structure comparison failed: %s", exc)
         return None
