@@ -21,7 +21,7 @@ Callers bring the energies (an ASE calculator, a batched torch-sim model via
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Tuple
 
 from pymatgen.core import Structure
 
@@ -132,15 +132,20 @@ def fill_near_hull(
     energies: Energies,
     limit: int = 2000,
     near_hull_ev: float = NEAR_HULL_EV,
+    prepare: Optional[Callable[[Sequence[str]], Any]] = None,
 ) -> Tuple[int, int]:
     """Score the system's missing near-hull references on ``db.surface``.
 
     At most ``limit`` per call (the closest to the hull first); the rest
-    wait for a later run or the bulk job. Returns (scored, still_missing).
+    wait for a later run or the bulk job. ``prepare`` is called with the
+    ids about to be scored first (a copy filled without geometries loads
+    theirs). Returns (scored, still_missing).
     """
     missing = missing_near_hull(db, chemical_system, near_hull_ev)
     if not missing:
         return 0, 0
+    if prepare is not None:
+        prepare(missing[:limit])
     todo = []
     for sid in missing[:limit]:
         structure = reference_structure(db, sid)

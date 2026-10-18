@@ -189,6 +189,7 @@ def assess(
     on.
     """
     from .database import StructureDatabase
+    from .ouro import stored_id
 
     hull_surface = get_surface(hull_surface or surface).id
     correction = mp2020_correction(structure, energy_per_atom)
@@ -199,12 +200,21 @@ def assess(
         )
     chemsys = "-".join(sorted({el.symbol for el in structure.composition.elements}))
     scored = missing = 0
-    with shared.working_copy([chemsys], surface=surface) as work:
+    formula = structure.composition.reduced_formula
+    # Matching needs the geometries of this formula only, and the hull none;
+    # references about to be scored get theirs when needed.
+    with shared.working_copy([chemsys], surface=surface, geometries=[formula], runs=False) as work:
         intake = add_if_new(
             work, structure, energy_per_atom, source=source, source_id=source_id, metadata=metadata
         )
         if hull_surface == work.surface:
-            scored, missing = fill_near_hull(work, chemsys, energies, limit=fill_limit)
+            scored, missing = fill_near_hull(
+                work,
+                chemsys,
+                energies,
+                limit=fill_limit,
+                prepare=lambda ids: shared.load_geometries(work, ids),
+            )
             if scored:
                 log(f"Scored {scored} reference phase(s) near the PBE hull with no {get_surface(surface).label} energy yet")
         hull_db = (
@@ -227,11 +237,11 @@ def assess(
             if hull_db is not work:
                 hull_db.close()
 
+    intake.structure_id = stored_id(work, intake.structure_id)
     corrected = energy_per_atom + correction.per_atom
     diagram, entry, e_above, formation, decomposition = place_on_hull(
         structure, corrected, references
     )
-    formula = structure.composition.reduced_formula
     same = [e for e in references if e.composition.reduced_formula == formula]
     if same:
         lowest = min(same, key=diagram.get_form_energy_per_atom)

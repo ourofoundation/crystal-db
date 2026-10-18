@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 from pymatgen.core import Structure
 
-from .sources import is_published
+from .sources import SOURCES, is_published
 
 if TYPE_CHECKING:
     from .database import StoredStructure, StructureDatabase
@@ -140,9 +140,12 @@ def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[
                 )
             )
     # Equally close matches (polymorph duplicates within float noise) keep a
-    # fixed order, whatever order the candidates were read in.
+    # fixed order, whatever order the candidates were read in: by source as
+    # crystaldb.sources lists them (Materials Project first), then by id.
+    rank = {source: i for i, source in enumerate(SOURCES)}
     return sorted(
-        matches, key=lambda m: (round(m.rms_distance, 4), m.source_id or "", m.structure_id)
+        matches,
+        key=lambda m: (round(m.rms_distance, 4), rank.get(m.source, len(rank)), m.source_id or "", m.structure_id),
     )
 
 

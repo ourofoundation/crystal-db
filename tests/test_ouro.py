@@ -11,7 +11,7 @@ import pytest
 from pymatgen.core import Lattice, Structure
 
 from crystaldb.database import StructureDatabase
-from crystaldb.ouro import PRIMARY_KEYS, OuroSharedDatabase
+from crystaldb.ouro import PRIMARY_KEYS, OuroSharedDatabase, stored_id
 from crystaldb.testing import FakeOuro
 
 FECO = Structure(Lattice.cubic(2.9), ["Fe", "Co"], [[0, 0, 0], [0.5] * 3]).composition.reduced_formula
@@ -215,3 +215,71 @@ def test_a_failed_bulk_job_sends_nothing(fake):
             add(db, bcc("Ni", 2.9), -5.6, source="mp", source_id="mp-new")
             raise RuntimeError("import failed")
     assert fake.db.get_structure_by_source("mp", "mp-new") is None
+
+
+def test_a_lean_copy_reads_only_what_it_needs(fake):
+    store = OuroSharedDatabase(fake, fake.ids)
+    count = lambda db, table: db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    with store.working_copy(["Co-Fe"], geometries=[FECO], runs=False) as db:
+        assert count(db, "structures") == 4 and count(db, "calculations") == 4
+        # Geometries of the formula being matched only, and no runs.
+        assert count(db, "geometries") == 2
+        assert count(db, "runs") == 0 and count(db, "run_structures") == 0
+        fe = db.get_structure_by_source("mp", "mp-13")
+        assert db.get_geometry(fe.id) is None
+        assert store.load_geometries(db, [fe.id]) == 1
+        assert db.get_geometry(fe.id) is not None
+        before = fake.server.execute("SELECT updated_at FROM geometries WHERE structure_id = ?", (fe.id,)).fetchone()[0]
+    # Loaded geometries are not changes: nothing went back.
+    after = fake.server.execute("SELECT updated_at FROM geometries WHERE structure_id = ?", (fe.id,)).fetchone()[0]
+    assert after == before
+    assert fake.server.execute("SELECT count(*) FROM run_structures").fetchone()[0] == 1
+
+
+def test_concurrent_adds_of_one_file_report_the_stored_id(fake):
+    store = OuroSharedDatabase(fake, fake.ids)
+    # Both copies are filled before either sends: each adds the file as new.
+    with store.working_copy(["Ni"]) as first:
+        with store.working_copy(["Ni"]) as second:
+            winner = add(second, bcc("Ni", 2.83), -5.45, source="ouro", source_id="file-1")
+        loser = add(first, bcc("Ni", 2.83), -5.45, source="ouro", source_id="file-1")
+    rows = fake.server.execute("SELECT id FROM structures WHERE source = 'ouro'").fetchall()
+    assert [row[0] for row in rows] == [winner]
+    assert loser != winner
+    assert stored_id(first, loser) == winner and stored_id(second, winner) == winner
+    # The loser's energy landed on the stored row, under its id.
+    assert fake.server.execute(
+        "SELECT count(*) FROM calculations WHERE structure_id = ?", (loser,)
+    ).fetchone()[0] == 0
+
+
+def test_one_row_pages_read_every_row(fake, monkeypatch):
+    import crystaldb.ouro as module
+
+    # A page of one row: the structures after the first come by key range,
+    # and their child rows are looked up page by page.
+    monkeypatch.setattr(module, "PAGE_ROWS", 1)
+    store = OuroSharedDatabase(fake, fake.ids)
+    with store.reader(systems=["Co-Fe"]) as db:
+        for table, expected in (("structures", 4), ("geometries", 4), ("calculations", 4), ("run_structures", 1), ("runs", 1)):
+            assert db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == expected, table
+
+
+def test_an_insert_that_clashes_merges_and_retries(fake, monkeypatch):
+    store = OuroSharedDatabase(fake, fake.ids)
+    lookup = store._existing
+    calls = []
+
+    def stale_first_lookup(structures, filled):
+        # The first lookup ran before the other run's insert landed.
+        calls.append(1)
+        return {} if len(calls) == 1 else lookup(structures, filled)
+
+    with store.working_copy(["Ni"]) as first:
+        with store.working_copy(["Ni"]) as second:
+            winner = add(second, bcc("Ni", 2.83), -5.45, source="ouro", source_id="file-1")
+        monkeypatch.setattr(store, "_existing", stale_first_lookup)
+        loser = add(first, bcc("Ni", 2.83), -5.45, source="ouro", source_id="file-1")
+    assert len(calls) == 2  # the upsert clashed, and the merge ran again
+    assert stored_id(first, loser) == winner
+    assert fake.server.execute("SELECT count(*) FROM structures WHERE source = 'ouro'").fetchone()[0] == 1

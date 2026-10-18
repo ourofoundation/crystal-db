@@ -43,6 +43,9 @@ class Intake:
     match: Optional[Match]
     # How the structure compares with published data (known, new polymorph, ...).
     novelty: NoveltyResult
+    # False when the stored row already held this geometry, energy and
+    # metadata (UPDATED with nothing written).
+    changed: bool = True
 
 
 def _unchanged(
@@ -89,6 +92,7 @@ def add_if_new(
     sg_number, sg_symbol = space_group(structure)
     cif = structure.to(fmt="cif")
     total = energy_per_atom * len(structure)
+    changed = True
 
     own = None
     if source_id is not None:
@@ -99,7 +103,7 @@ def add_if_new(
     if own is not None and _unchanged(db, own["id"], cif, energy_per_atom, metadata):
         # The same file scored the same way again: nothing to write, so no
         # shard reaches the writer.
-        sid, status, match = own["id"], UPDATED, None
+        sid, status, match, changed = own["id"], UPDATED, None, False
     elif own is not None:
         sid = own["id"]
         elements = sorted(stoichiometry)
@@ -162,4 +166,4 @@ def add_if_new(
     if run_id is not None:
         db.link_structure_to_run(run_id, sid)
     db._commit()
-    return Intake(status=status, structure_id=sid, match=match, novelty=novelty)
+    return Intake(status=status, structure_id=sid, match=match, novelty=novelty, changed=changed)

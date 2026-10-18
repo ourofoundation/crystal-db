@@ -69,6 +69,15 @@ class FakeOuro:
             rows = [dict(row) for row in self.server.execute(sql)]
             return Response({"data": [self._as_api(row) for row in rows]})
         table = self.names[path.split("/")[2]]
+        try:
+            return self._write(table, json)
+        except sqlite3.IntegrityError as exc:
+            # As Postgres does: a row that clashes with another unique key
+            # (the same source and source id) fails the whole batch.
+            self.server.rollback()
+            return Response({"error": {"message": f"duplicate key value violates unique constraint: {exc}"}}, 409)
+
+    def _write(self, table, json):
         key = PRIMARY_KEYS[table]
         updated = 0
         for row in json["rows"]:
@@ -84,8 +93,13 @@ class FakeOuro:
                 )
                 updated += cursor.rowcount
                 continue
+            # An upsert by primary key (INSERT OR REPLACE would instead
+            # delete a row clashing on another unique key).
+            sets = [column for column in columns if column not in key]
             self.server.execute(
-                f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))}) "
+                f"ON CONFLICT ({', '.join(key)}) DO "
+                + (f"UPDATE SET {', '.join(f'{column} = excluded.{column}' for column in sets)}" if sets else "NOTHING"),
                 values,
             )
         self.server.commit()

@@ -27,13 +27,14 @@ import logging
 import queue
 import shutil
 import tempfile
+import threading
 import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .database import StructureDatabase
 from .surfaces import DEFAULT_SURFACE
@@ -52,10 +53,11 @@ BOOLEANS = {"is_valid", "is_on_hull", "is_dynamically_stable"}
 JSON_COLUMNS = {"elements", "stoichiometry", "metadata", "hubbards", "parameters"}
 # Rows per read page and per upsert request (upserts are also capped by size).
 PAGE_ROWS = 5000
-# Ids per lookup query (each id is a primary key lookup), and lookups in
-# flight at once while filling a copy.
+# Ids per lookup query (each id is a primary key lookup).
 ID_CHUNK = 1000
-FILL_REQUESTS = 6
+# Most read requests one store has in flight, across every copy it fills at
+# once (a route container fills several), so the API is never flooded.
+MAX_REQUESTS = 12
 UPSERT_ROWS = 2000
 UPSERT_BYTES = 5_000_000
 UPSERT_REQUESTS = 4
@@ -77,6 +79,13 @@ class OuroError(RuntimeError):
     """A request to Ouro failed."""
 
 
+def stored_id(db: StructureDatabase, structure_id: str) -> str:
+    """The id a structure added in a working copy is stored under once the
+    copy's changes are sent: its own, unless a concurrent run stored the
+    same structure first (``working_copy``)."""
+    return getattr(db, "merged_ids", {}).get(structure_id, structure_id)
+
+
 class OuroSharedDatabase:
     def __init__(self, ouro: Any, datasets: Dict[str, str]):
         """``datasets`` maps each table name to its dataset id."""
@@ -89,6 +98,7 @@ class OuroSharedDatabase:
         self._columns: Dict[str, List[str]] = {}
         self._counts: Optional[Tuple[float, Dict[str, Dict[str, Any]]]] = None
         self._uncommitted = 0
+        self._slots = threading.BoundedSemaphore(MAX_REQUESTS)
 
     # -------------------- Requests --------------------
 
@@ -119,10 +129,27 @@ class OuroSharedDatabase:
 
     def query(self, sql: str) -> List[Dict[str, Any]]:
         """Rows of a read-only SQL query over the tables (``self.table(name)``)."""
-        rows = self._request(
-            "post", f"/datasets/{self.datasets['structures']}/query-custom", json={"query": sql}
-        )
+        with self._slots:
+            rows = self._request(
+                "post", f"/datasets/{self.datasets['structures']}/query-custom", json={"query": sql}
+            )
         return rows or []
+
+    def _page(self, table: str, select: str, where: str) -> List[Dict[str, Any]]:
+        """The first PAGE_ROWS rows of a filtered table read, in key order."""
+        key_cols = ", ".join(f"t.{column}" for column in PRIMARY_KEYS[table])
+        return self.query(
+            f"SELECT {select} FROM {self.table(table)} t WHERE ({where}) "
+            f"ORDER BY {key_cols} LIMIT {PAGE_ROWS}"
+        )
+
+    @staticmethod
+    def _after(table: str, row: Dict[str, Any]) -> str:
+        """Rows with a primary key past ``row``'s (the table as ``t``)."""
+        key = PRIMARY_KEYS[table]
+        key_cols = ", ".join(f"t.{column}" for column in key)
+        values = ", ".join(_literal(row[column]) for column in key)
+        return f"({key_cols}) > ({values})"
 
     def _keyed_pages(self, table: str, select: str, where: str) -> Iterator[List[Dict[str, Any]]]:
         """Pages of a filtered table read, in primary key order.
@@ -130,23 +157,26 @@ class OuroSharedDatabase:
         ``select`` and ``where`` refer to the table as ``t``. Each page
         starts after the last row's key, so every page costs the same.
         """
-        alias = "t"
-        key = PRIMARY_KEYS[table]
-        key_cols = ", ".join(f"{alias}.{column}" for column in key)
-        after = ""
+        condition = where
         while True:
-            rows = self.query(
-                f"SELECT {select} FROM {self.table(table)} {alias} WHERE ({where}){after} "
-                f"ORDER BY {key_cols} LIMIT {PAGE_ROWS}"
-            )
+            rows = self._page(table, select, condition)
             if not rows:
                 return
             yield rows
             if len(rows) < PAGE_ROWS:
                 return
-            last = rows[-1]
-            values = ", ".join(_literal(last[column]) for column in key)
-            after = f" AND ({key_cols}) > ({values})"
+            condition = f"({where}) AND {self._after(table, rows[-1])}"
+
+    def _pages(self, table: str, select: str, where: str) -> Iterator[List[Dict[str, Any]]]:
+        """Pages of a filtered table read: one request when the rows fit in
+        a page, else the rest by key range, several ranges at once (pages
+        then come in no particular order)."""
+        rows = self._page(table, select, where)
+        if rows:
+            yield rows
+        if len(rows) < PAGE_ROWS:
+            return
+        yield from self._ranged_pages(table, select, f"({where}) AND {self._after(table, rows[-1])}")
 
     def _ranged_pages(self, table: str, select: str, where: str) -> Iterator[List[Dict[str, Any]]]:
         """Pages of a filtered table read in KEY_RANGES ranges of its first
@@ -230,13 +260,17 @@ class OuroSharedDatabase:
         everything: bool = False,
         surface: Optional[str] = None,
         surfaces: Optional[Iterable[str]] = None,
-        geometries: bool = True,
+        geometries: Union[bool, Iterable[str]] = True,
+        runs: bool = True,
     ) -> Tuple[StructureDatabase, Dict[str, str]]:
         """A local StructureDatabase holding the structures selected by
         chemical system (with subsystems), reduced formula, id or source (or
         every structure), with their geometries, calculations and runs.
-        ``surfaces`` limits the calculations to those surfaces, and
-        ``geometries=False`` leaves geometries out (hulls need neither).
+        ``surfaces`` limits the calculations to those surfaces.
+        ``geometries`` is True for every geometry, False for none (hulls need
+        none), or reduced formulas whose structures' geometries to read
+        (matching a structure needs only its formula's; ``load_geometries``
+        fetches others later). ``runs=False`` leaves runs and their links out.
         Returns it and the ``updated_at`` of each structure it holds, by id."""
         subsystems = sorted(
             {
@@ -247,80 +281,98 @@ class OuroSharedDatabase:
                 )
             }
         )
-        conditions = []
+        # (column, values) of the structures selected; any one may match.
+        selectors: List[Tuple[str, Sequence[Any]]] = []
         if subsystems:
-            conditions.append(f"t.chemsys IN ({_literals(subsystems)})")
+            selectors.append(("chemsys", subsystems))
         formulas = sorted(set(formulas))
         if formulas:
-            conditions.append(f"t.reduced_formula IN ({_literals(formulas)})")
+            selectors.append(("reduced_formula", formulas))
         ids = sorted(set(structure_ids))
         for chunk in _chunks(ids, ID_CHUNK):
-            conditions.append(f"t.id IN ({_literals(chunk)})")
+            selectors.append(("id", chunk))
         sources = sorted(set(sources))
         if sources:
-            conditions.append(f"t.source IN ({_literals(sources)})")
-        if everything:
-            conditions = ["TRUE"]
+            selectors.append(("source", sources))
+
         # Only a copy of whole sources (or everything) reads by key range.
-        bulk = everything or (bool(sources) and len(conditions) == 1)
+        bulk = everything or (bool(sources) and len(selectors) == 1)
         db = StructureDatabase(out_path, surface=surface or DEFAULT_SURFACE)
-        if not conditions:
+        if not selectors and not everything:
             _snapshot_hulls(db)
             return db, {}
 
         started = time.time()
         held: Dict[str, str] = {}
-        where = " OR ".join(conditions)
-        pages = self._ranged_pages if bulk else self._keyed_pages
+        where = "TRUE" if everything else " OR ".join(
+            f"t.{column} IN ({_literals(values)})" for column, values in selectors
+        )
+        children = {"calculations": "TRUE"}
+        if runs:
+            children["run_structures"] = "TRUE"
+        if geometries:
+            children["geometries"] = "TRUE"
+        geometry_formulas = None if geometries is True or not geometries else set(geometries)
+        if surfaces is not None:
+            children["calculations"] = f"t.surface IN ({_literals(sorted(set(surfaces))) or 'NULL'})"
         # Millions of rows arrive in random key order: load them without the
         # secondary indexes, in a big cache, committing as they come, and
         # build the indexes once at the end.
         indexes = _drop_indexes(db) if bulk else []
         if bulk:
             db.conn.execute(f"PRAGMA cache_size=-{BULK_CACHE_KIB}")
-        for rows in pages("structures", "t.*", where):
-            self._insert(db, "structures", rows, commit=bulk)
-            held.update((row["id"], row["updated_at"]) for row in rows)
-        counts = {"structures": len(held)}
-        children = {"calculations": "TRUE", "run_structures": "TRUE"}
-        if geometries:
-            children["geometries"] = "TRUE"
-        if surfaces is not None:
-            children["calculations"] = f"t.surface IN ({_literals(sorted(set(surfaces))) or 'NULL'})"
-        if bulk and len(held) > BULK_CHILDREN:
-            # Most of the database: read the child tables whole by key range
-            # (filtering by source on the server costs a join per page), then
-            # drop the rows of structures the copy does not hold.
+        counts: Dict[str, int] = {}
+        lookups: Dict[Any, str] = {}
+        pool = ThreadPoolExecutor(max_workers=MAX_REQUESTS)
+
+        def look_up_children(structures: Iterable[Dict[str, Any]]) -> None:
+            """Queue the child rows of some structures: primary key lookups
+            by chunks of ids (a child table's own key ranges are slow to
+            filter on the server). Geometries only for ``geometry_formulas``
+            when given."""
+            structures = list(structures)
             for table, filter in children.items():
-                for rows in self._ranged_pages(table, "t.*", filter):
-                    self._insert(db, table, rows, commit=True)
-                if not everything:
-                    db.conn.execute(f"DELETE FROM {table} WHERE structure_id NOT IN (SELECT id FROM structures)")
-                counts[table] = db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-        else:
-            # Children by chunks of ids (primary key lookups), several
-            # requests at once; rows go into the copy as each answer arrives.
-            tasks = [
-                (
-                    table,
-                    f"SELECT * FROM {self.table(table)} t "
-                    f"WHERE t.structure_id IN ({_literals(chunk)}) AND {filter}",
+                ids = [
+                    row["id"]
+                    for row in structures
+                    if table != "geometries" or geometry_formulas is None or row["reduced_formula"] in geometry_formulas
+                ]
+                for chunk in _chunks(ids, ID_CHUNK):
+                    sql = f"SELECT * FROM {self.table(table)} t WHERE t.structure_id IN ({_literals(chunk)}) AND {filter}"
+                    lookups[pool.submit(self.query, sql)] = table
+
+        try:
+            for rows in (self._ranged_pages if bulk else self._pages)("structures", "t.*", where):
+                self._insert(db, "structures", rows, commit=bulk)
+                held.update((row["id"], row["updated_at"]) for row in rows)
+                if not bulk:
+                    # Children are looked up while further pages arrive.
+                    look_up_children(rows)
+            counts["structures"] = len(held)
+            if bulk and len(held) > BULK_CHILDREN:
+                # Most of the database: read the child tables whole by key
+                # range (filtering by source on the server costs a join per
+                # page), then drop the rows of structures the copy does not hold.
+                for table, filter in children.items():
+                    for rows in self._ranged_pages(table, "t.*", filter):
+                        self._insert(db, table, rows, commit=True)
+                    if not everything:
+                        db.conn.execute(f"DELETE FROM {table} WHERE structure_id NOT IN (SELECT id FROM structures)")
+                    counts[table] = db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            elif bulk:
+                look_up_children(
+                    {"id": row[0], "reduced_formula": row[1]}
+                    for row in db.conn.execute("SELECT id, reduced_formula FROM structures")
                 )
-                for table, filter in children.items()
-                for chunk in _chunks(list(held), ID_CHUNK)
-            ]
-            with ThreadPoolExecutor(max_workers=FILL_REQUESTS) as pool:
-                futures = {pool.submit(self.query, sql): table for table, sql in tasks}
-                for future in as_completed(futures):
-                    table, rows = futures[future], future.result()
-                    counts[table] = counts.get(table, 0) + len(rows)
-                    if rows:
-                        self._insert(db, table, rows, commit=bulk)
-        run_ids = [row[0] for row in db.conn.execute("SELECT DISTINCT run_id FROM run_structures")]
-        for chunk in _chunks(run_ids, ID_CHUNK):
-            rows = self.query(f"SELECT * FROM {self.table('runs')} WHERE id IN ({_literals(chunk)})")
-            if rows:
-                self._insert(db, "runs", rows)
+            # Rows go into the copy as each answer arrives.
+            for future in as_completed(lookups):
+                table, rows = lookups[future], future.result()
+                counts[table] = counts.get(table, 0) + len(rows)
+                if rows:
+                    self._insert(db, table, rows, commit=bulk)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+        self._fill_runs(db, runs)
         db._commit()
         if indexes:
             indexing = time.time()
@@ -333,6 +385,37 @@ class OuroSharedDatabase:
         db._commit()
         logger.info("Filled %s in %.1f s", counts, time.time() - started)
         return db, held
+
+    def _fill_runs(self, db: StructureDatabase, runs: bool) -> None:
+        """The runs a copy's run links point to (``runs=False``: none)."""
+        if not runs:
+            return
+        run_ids = [row[0] for row in db.conn.execute("SELECT DISTINCT run_id FROM run_structures")]
+        for chunk in _chunks(run_ids, ID_CHUNK):
+            rows = self.query(f"SELECT * FROM {self.table('runs')} WHERE id IN ({_literals(chunk)})")
+            if rows:
+                self._insert(db, "runs", rows)
+
+    def load_geometries(self, db: StructureDatabase, structure_ids: Iterable[str]) -> int:
+        """Bring the stored geometries of some structures into a copy filled
+        without them (``geometries=`` a list of formulas). They keep their
+        stored ``updated_at``, so they never count as the copy's changes.
+        Returns the number of geometries added."""
+        have = {row[0] for row in db.conn.execute("SELECT DISTINCT structure_id FROM geometries")}
+        ids = sorted(set(structure_ids) - have)
+        added = 0
+        with ThreadPoolExecutor(max_workers=MAX_REQUESTS) as pool:
+            for rows in pool.map(
+                lambda chunk: self.query(
+                    f"SELECT * FROM {self.table('geometries')} WHERE structure_id IN ({_literals(chunk)})"
+                ),
+                list(_chunks(ids, ID_CHUNK)),
+            ):
+                if rows:
+                    self._insert(db, "geometries", rows)
+                    added += len(rows)
+        db._commit()
+        return added
 
     def _insert(
         self, db: StructureDatabase, table: str, rows: List[Dict[str, Any]], commit: bool = False
@@ -360,9 +443,12 @@ class OuroSharedDatabase:
         systems: Iterable[str] = (),
         formulas: Iterable[str] = (),
         structure_ids: Iterable[str] = (),
+        geometries: Union[bool, Iterable[str]] = True,
+        runs: bool = True,
     ) -> StructureDatabase:
         """A read-only local copy of the selected structures; its files go
-        away when it is closed."""
+        away when it is closed. ``geometries`` and ``runs`` leave out what
+        the caller does not read (see ``_fill``)."""
         tmp = tempfile.mkdtemp(prefix="crystaldb-read-")
         try:
             db, _ = self._fill(
@@ -371,6 +457,8 @@ class OuroSharedDatabase:
                 formulas=formulas,
                 structure_ids=structure_ids,
                 surface=surface,
+                geometries=geometries,
+                runs=runs,
             )
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -392,8 +480,11 @@ class OuroSharedDatabase:
         systems: Iterable[str] = (),
         formulas: Iterable[str] = (),
         structure_ids: Iterable[str] = (),
+        geometries: Union[bool, Iterable[str]] = True,
+        runs: bool = True,
     ) -> Iterator[StructureDatabase]:
-        """A read-only local copy of the selected structures."""
+        """A read-only local copy of the selected structures (``geometries``
+        and ``runs`` as in ``_fill``)."""
         with tempfile.TemporaryDirectory(prefix="crystaldb-read-") as tmp:
             db, _ = self._fill(
                 Path(tmp) / "read.db",
@@ -401,6 +492,8 @@ class OuroSharedDatabase:
                 formulas=formulas,
                 structure_ids=structure_ids,
                 surface=surface,
+                geometries=geometries,
+                runs=runs,
             )
             try:
                 yield db
@@ -415,6 +508,8 @@ class OuroSharedDatabase:
         surface: Optional[str] = None,
         *,
         structure_ids: Iterable[str] = (),
+        geometries: Union[bool, Iterable[str]] = True,
+        runs: bool = True,
     ) -> Iterator[StructureDatabase]:
         """A writable local copy of some systems; changes are upserted on exit.
 
@@ -422,14 +517,25 @@ class OuroSharedDatabase:
         so hulls built from it match the shared database. Changes are sent
         even when the block raises, so work done before a failure is kept.
         ``ingest`` replaces the upsert with a callable taking the changes as
-        a SQLite file's bytes (tests and dry runs).
+        a SQLite file's bytes (tests and dry runs). ``geometries`` and
+        ``runs`` leave out what the caller does not read (see ``_fill``).
+
+        After the block, ``db.merged_ids`` maps the id of each structure the
+        copy added that the shared tables already held under another id (a
+        concurrent run stored it first) to that id; ``stored_id`` reads it.
         """
         systems = list(chemical_systems)
         with tempfile.TemporaryDirectory(prefix="crystaldb-work-") as tmp:
             since = datetime.now().isoformat()
             db, held = self._fill(
-                Path(tmp) / "work.db", systems=systems, structure_ids=structure_ids, surface=surface
+                Path(tmp) / "work.db",
+                systems=systems,
+                structure_ids=structure_ids,
+                surface=surface,
+                geometries=geometries,
+                runs=runs,
             )
+            db.merged_ids = {}
             try:
                 yield db
             finally:
@@ -500,6 +606,7 @@ class OuroSharedDatabase:
         result: Dict[str, Any] = {}
         if changed:
             result = ingest(delta_path.read_bytes()) if ingest is not None else self.push(delta_path, filled=held)
+            db.merged_ids = result.pop("merged_ids", {})
         if patches:
             result["hull_patches"] = len(patches) if ingest is not None else self.update("calculations", patches)
         logger.info(
@@ -510,7 +617,7 @@ class OuroSharedDatabase:
 
     # -------------------- Writing changes back --------------------
 
-    def push(self, delta_path: Path, filled: Optional[Dict[str, str]] = None) -> Dict[str, int]:
+    def push(self, delta_path: Path, filled: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Upsert a SQLite file of changes (``StructureDatabase.export_changes``).
 
         A structure the shared tables already hold under another id (the same
@@ -522,6 +629,8 @@ class OuroSharedDatabase:
         filled with: those need no lookup, and the ones it did not change are
         not written back (a change file carries them only to map ids, and
         writing them would undo whatever changed them since).
+        Returns the rows written per table, and ``merged_ids``: each merged
+        structure's id in the file mapped to the id it is stored under.
         """
         delta = StructureDatabase(delta_path, readonly=True)
         try:
@@ -540,7 +649,7 @@ class OuroSharedDatabase:
         finally:
             delta.close()
 
-    def _push(self, delta: StructureDatabase, filled: Dict[str, str]) -> Dict[str, int]:
+    def _push(self, delta: StructureDatabase, filled: Dict[str, str]) -> Dict[str, Any]:
         rows = {
             table: [dict(row) for row in delta.conn.execute(f"SELECT * FROM {table}")]
             for table in TABLES
@@ -584,6 +693,7 @@ class OuroSharedDatabase:
         }
         counts["new_structures"] = new
         counts["merged_into_existing"] = merged
+        counts["merged_ids"] = {old: stored for old, stored in target.items() if old != stored}
         return counts
 
     def _existing(self, structures: List[Dict[str, Any]], filled: Dict[str, str]) -> Dict[Any, Dict[str, Any]]:
