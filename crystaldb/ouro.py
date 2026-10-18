@@ -61,10 +61,10 @@ MAX_REQUESTS = 12
 UPSERT_ROWS = 2000
 UPSERT_BYTES = 5_000_000
 UPSERT_REQUESTS = 4
-# Keys per delete request: the API takes at most 1,000, and for a
-# single-column key it filters by them in the query string, which ~150
-# uuids already fill.
-DELETE_KEYS = 1000
+# Keys per delete request. The API takes at most 1,000 and a JSON body of
+# at most 100 kB (a two-uuid key is ~100 bytes), and filters a single-column
+# key by the ids in the query string, which ~150 uuids already fill.
+DELETE_KEYS = 400
 DELETE_IDS = 150
 # A copy of a large part of the database (everything, or a whole source)
 # reads each table in this many key ranges, several at once. Once it holds
