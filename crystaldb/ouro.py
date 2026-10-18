@@ -605,6 +605,10 @@ class OuroSharedDatabase:
             patches = _hull_patches(db, since)
         finally:
             db.close()
+        # A run whose structures were all known already changes no structure
+        # but still has its run row and links to send.
+        if not changed:
+            changed = _delta_rows(delta_path, ("runs", "run_structures"))
         if not changed and not patches:
             return {}
         sending = time.time()
@@ -755,6 +759,15 @@ class OuroSharedDatabase:
 
 
 # -------------------- Hull distances --------------------
+
+
+def _delta_rows(path: Path, tables: Sequence[str]) -> int:
+    """Rows in some tables of a change file."""
+    delta = StructureDatabase(path, readonly=True)
+    try:
+        return sum(delta.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in tables)
+    finally:
+        delta.close()
 
 
 def _drop_indexes(db: StructureDatabase) -> List[str]:

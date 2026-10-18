@@ -283,3 +283,16 @@ def test_an_insert_that_clashes_merges_and_retries(fake, monkeypatch):
     assert len(calls) == 2  # the upsert clashed, and the merge ran again
     assert stored_id(first, loser) == winner
     assert fake.server.execute("SELECT count(*) FROM structures WHERE source = 'ouro'").fetchone()[0] == 1
+
+
+def test_a_run_of_known_structures_still_sends_its_links(fake):
+    store = OuroSharedDatabase(fake, fake.ids)
+    feco = fake.db.get_structure_by_source("mp", "mp-2090")
+    with store.working_copy(["Co-Fe"]) as db:
+        run_id = db.create_run("Co-Fe")
+        # Nothing new is stored: the run only finds a published structure.
+        db.link_structure_to_run(run_id, feco.id)
+        db.complete_run(run_id, num_candidates=1, num_successful=0, num_failed=0)
+    assert fake.server.execute("SELECT count(*) FROM runs WHERE id = ?", (run_id,)).fetchone()[0] == 1
+    links = fake.server.execute("SELECT structure_id FROM run_structures WHERE run_id = ?", (run_id,)).fetchall()
+    assert [row[0] for row in links] == [feco.id]
