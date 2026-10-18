@@ -1,10 +1,11 @@
 """A stand-in for Ouro's dataset endpoints, for testing code that uses
 ``crystaldb.ouro.OuroSharedDatabase`` without a server.
 
-``FakeOuro`` keeps the five tables in one SQLite file and answers the two
+``FakeOuro`` keeps the five tables in one SQLite file and answers the
 endpoints the store uses the way the API does: read-only SQL returns rows
 with JSON columns parsed and flags as booleans, upserts replace rows by
-primary key, and updates set the given columns of rows matched by key. ``fake.db`` is a ``StructureDatabase`` on that file, for
+primary key, updates set the given columns of rows matched by key, and
+deletes remove rows by key. ``fake.db`` is a ``StructureDatabase`` on that file, for
 setting up and inspecting what the server holds.
 
     fake = FakeOuro(tmp_path / "server.db")
@@ -57,6 +58,23 @@ class FakeOuro:
     def get(self, path, **_):
         dataset_id = path.rsplit("/", 1)[-1]
         return Response({"data": {"metadata": {"table_name": f"dataset_{self.names[dataset_id]}"}}})
+
+    def request(self, method, path, json=None, **_):
+        """DELETE /datasets/:id/rows: rows by primary key (a value, or a dict
+        of the key columns)."""
+        assert method == "DELETE" and path.endswith("/rows"), (method, path)
+        with self.lock:
+            table = self.names[path.split("/")[2]]
+            key = PRIMARY_KEYS[table]
+            deleted = 0
+            for item in json["ids"]:
+                values = [item] if len(key) == 1 and not isinstance(item, dict) else [item[c] for c in key]
+                cursor = self.server.execute(
+                    f"DELETE FROM {table} WHERE {' AND '.join(f'{c} = ?' for c in key)}", values
+                )
+                deleted += cursor.rowcount
+            self.server.commit()
+            return Response({"data": {"deleted": deleted}})
 
     def post(self, path, json=None, **_):
         with self.lock:

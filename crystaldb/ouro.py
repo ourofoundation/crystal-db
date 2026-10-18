@@ -61,6 +61,8 @@ MAX_REQUESTS = 12
 UPSERT_ROWS = 2000
 UPSERT_BYTES = 5_000_000
 UPSERT_REQUESTS = 4
+# Keys per delete request (the API's limit).
+DELETE_KEYS = 1000
 # A copy of a large part of the database (everything, or a whole source)
 # reads each table in this many key ranges, several at once. Once it holds
 # more structures than BULK_CHILDREN, its child rows come by key range too
@@ -104,7 +106,11 @@ class OuroSharedDatabase:
     # -------------------- Requests --------------------
 
     def _request(self, method: str, path: str, **kwargs) -> Any:
-        response = getattr(self.ouro.client, method)(path, **kwargs)
+        if method == "delete":
+            # A DELETE with a body goes through the client's generic request.
+            response = self.ouro.client.request("DELETE", path, **kwargs)
+        else:
+            response = getattr(self.ouro.client, method)(path, **kwargs)
         try:
             body = response.json()
         except ValueError:
@@ -233,6 +239,23 @@ class OuroSharedDatabase:
         of rows updated."""
         return self._write(table, rows, "update")
 
+    def delete(self, table: str, keys: Sequence[Dict[str, Any]]) -> int:
+        """Delete rows by primary key (each key a dict of the key columns).
+        Returns the number of rows deleted."""
+        key = PRIMARY_KEYS[table]
+        ids = [row[key[0]] if len(key) == 1 else {column: row[column] for column in key} for row in keys]
+        dataset_id = self.datasets[table]
+
+        def send(chunk: Sequence[Any]) -> int:
+            data = self._request("delete", f"/datasets/{dataset_id}/rows", json={"ids": list(chunk)})
+            return int((data or {}).get("deleted", 0))
+
+        chunks = list(_chunks(ids, DELETE_KEYS))
+        if len(chunks) <= 1:
+            return sum(send(chunk) for chunk in chunks)
+        with ThreadPoolExecutor(max_workers=UPSERT_REQUESTS) as pool:
+            return sum(pool.map(send, chunks))
+
     def _write(self, table: str, rows: Sequence[Dict[str, Any]], mode: str) -> int:
         dataset_id = self.datasets[table]
         batches = list(_batches(rows))
@@ -290,9 +313,8 @@ class OuroSharedDatabase:
         selectors: List[Tuple[str, Sequence[Any]]] = []
         if subsystems:
             selectors.append(("chemsys", subsystems))
-        formulas = sorted(set(formulas))
-        if formulas:
-            selectors.append(("reduced_formula", formulas))
+        for chunk in _chunks(sorted(set(formulas)), ID_CHUNK):
+            selectors.append(("reduced_formula", chunk))
         ids = sorted(set(structure_ids))
         for chunk in _chunks(ids, ID_CHUNK):
             selectors.append(("id", chunk))
