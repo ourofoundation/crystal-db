@@ -19,12 +19,15 @@ Imports torch lazily, so the module can be imported without the GPU stack
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
 from pymatgen.core import Structure
+
+logger = logging.getLogger(__name__)
 
 RECIPE = "orb-v3-conservative-inf-mpa/fire-frechet/fmax0.02/steps400"
 
@@ -125,6 +128,16 @@ class Scored:
     fmax: float
 
 
+def _free_gpu_memory() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def evaluate(
     ts_model, structures: Sequence[Structure], batch_atoms: int = SINGLEPOINT_BATCH_ATOMS
 ) -> List[Optional[Scored]]:
@@ -157,10 +170,15 @@ def evaluate(
     def score(batch: Sequence[Structure]) -> List[Optional[Scored]]:
         try:
             return run(batch)
-        except Exception:
-            if len(batch) == 1:
-                return [None]
-            return [r for s in batch for r in score([s])]
+        except Exception as exc:
+            logger.warning("Scoring %d structure(s) failed: %s", len(batch), str(exc)[:200])
+        # Retried outside the except block: the exception holds the failed
+        # batch's tensors, and a CUDA out-of-memory would recur for every
+        # structure while they are alive.
+        _free_gpu_memory()
+        if len(batch) == 1:
+            return [None]
+        return [r for s in batch for r in score([s])]
 
     order = sorted(range(len(structures)), key=lambda i: len(structures[i]))
     out: List[Optional[Scored]] = [None] * len(structures)
