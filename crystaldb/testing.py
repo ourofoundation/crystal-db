@@ -153,6 +153,6 @@ class FakeOuro:
             return json.dumps(value)
         return value
 
-    def store(self) -> OuroSharedDatabase:
+    def store(self, non_commercial: bool = False) -> OuroSharedDatabase:
         """An OuroSharedDatabase on this fake server."""
-        return OuroSharedDatabase(self, self.ids)
+        return OuroSharedDatabase(self, self.ids, non_commercial=non_commercial)

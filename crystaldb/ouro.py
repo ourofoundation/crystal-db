@@ -18,6 +18,13 @@ upserted straight back.
 ``ouro`` is an ``ouro.Ouro`` client (ouro-py) acting as a user who can
 read and write the datasets. Reads go through the datasets' read-only SQL
 endpoint, paged by key; writes through upserts by primary key.
+
+Copies leave out data licensed for non-commercial use (GNoME, MP's "BY-NC"
+records; ``crystaldb.sources.non_commercial_sql``), since Ouro's paid routes
+must not use it. A store for free routes opts in with
+``non_commercial=True``; its copies never store hull distances they computed
+on other structures (those hulls were shaped by the non-commercial data),
+so the stored distances paid routes read stay free of it.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from .database import StructureDatabase
+from .sources import non_commercial_sql
 from .surfaces import DEFAULT_SURFACE
 
 logger = logging.getLogger(__name__)
@@ -106,13 +114,16 @@ def stored_id(db: StructureDatabase, structure_id: str) -> str:
 
 
 class OuroSharedDatabase:
-    def __init__(self, ouro: Any, datasets: Dict[str, str]):
-        """``datasets`` maps each table name to its dataset id."""
+    def __init__(self, ouro: Any, datasets: Dict[str, str], *, non_commercial: bool = False):
+        """``datasets`` maps each table name to its dataset id.
+        ``non_commercial`` includes data licensed for non-commercial use
+        only; set it only for free routes (see the module docstring)."""
         missing = [table for table in TABLES if table not in datasets]
         if missing:
             raise ValueError(f"Dataset ids missing for: {', '.join(missing)}")
         self.ouro = ouro
         self.datasets = dict(datasets)
+        self.non_commercial = non_commercial
         self._tables: Optional[Dict[str, str]] = None
         self._columns: Dict[str, List[str]] = {}
         self._counts: Optional[Tuple[float, Dict[str, Dict[str, Any]]]] = None
@@ -365,6 +376,8 @@ class OuroSharedDatabase:
         where = "TRUE" if everything else " OR ".join(
             f"t.{column} IN ({_literals(values)})" for column, values in selectors
         )
+        if not self.non_commercial:
+            where = f"({where}) AND NOT {non_commercial_sql('t', 'postgres')}"
         children = {"calculations": "TRUE"}
         if runs:
             children["run_structures"] = "TRUE"
@@ -414,7 +427,7 @@ class OuroSharedDatabase:
                 for table, filter in children.items():
                     for rows in self._ranged_pages(table, "t.*", filter):
                         self._insert(db, table, rows, commit=True)
-                    if not everything:
+                    if not everything or not self.non_commercial:
                         db.conn.execute(f"DELETE FROM {table} WHERE structure_id NOT IN (SELECT id FROM structures)")
                     counts[table] = db.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             elif bulk:
@@ -654,6 +667,8 @@ class OuroSharedDatabase:
         """
         delta_path = db.db_path.parent / "delta.db"
         try:
+            if self.non_commercial:
+                _keep_commercial_hulls(db)
             changed = db.export_changes(delta_path, since)
             patches = _hull_patches(db, since)
         finally:
@@ -802,9 +817,12 @@ class OuroSharedDatabase:
             return self._count_sources()
 
     def _count_sources(self) -> Dict[str, Dict[str, Any]]:
+        where = "t.is_valid"
+        if not self.non_commercial:
+            where += f" AND NOT {non_commercial_sql('t', 'postgres')}"
         rows = self.query(
-            f"SELECT source, count(*) AS n FROM {self.table('structures')} "
-            f"WHERE is_valid GROUP BY source"
+            f"SELECT t.source, count(*) AS n FROM {self.table('structures')} t "
+            f"WHERE {where} GROUP BY t.source"
         )
         counts = {row["source"]: {"structures": row["n"], "imported_at": None} for row in rows}
         self._counts = (time.time(), counts)
@@ -842,6 +860,24 @@ def _snapshot_hulls(db: StructureDatabase) -> None:
     db.conn.execute("DROP TABLE IF EXISTS _filled_hulls")
     db.conn.execute(
         f"CREATE TABLE _filled_hulls AS SELECT structure_id, surface, {columns} FROM calculations"
+    )
+    db._commit()
+
+
+def _keep_commercial_hulls(db: StructureDatabase) -> None:
+    """Put back the stored hull distances of every structure not licensed
+    non-commercially (none for calculations the copy added): a copy holding
+    non-commercial data built its hulls with it, and paid routes read
+    those distances. The distances the copy computed were for its own use."""
+    columns = ", ".join(HULL_COLUMNS)
+    db.conn.execute(
+        f"""
+        UPDATE calculations SET ({columns}) = (
+            SELECT {', '.join(f'f.{column}' for column in HULL_COLUMNS)} FROM _filled_hulls f
+            WHERE f.structure_id = calculations.structure_id AND f.surface = calculations.surface
+        )
+        WHERE structure_id IN (SELECT s.id FROM structures s WHERE NOT {non_commercial_sql('s')})
+        """
     )
     db._commit()
 

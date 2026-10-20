@@ -7,6 +7,12 @@ Supports importing from:
     corrections
   - Alexandria local .json.bz2 chunks (provider='alexandria'): raw PBE
     energies, MP2020 applied here
+  - GNoME's summary table and CIF zip (provider='gnome'): raw PBE energies
+    shifted onto MP's pseudopotentials, MP2020 applied here
+
+Non-commercial data (GNoME, MP's "BY-NC" records) is imported like the rest
+and keeps its license in ``metadata.license``; paid routes never read it
+(see crystaldb/sources.py).
 
 Each structure is stored as published (the ``source`` geometry) with a
 ``pbe`` calculation; see ``crystaldb/sources.py``. Re-running an import refreshes
@@ -28,6 +34,10 @@ Usage:
     # Alexandria from downloaded chunk files
     python import.py --database structures.db --provider alexandria \\
         --alexandria-local-dir alexandria_pbe_2025_07_02
+
+    # GNoME from a directory holding stable_materials_summary.csv and by_id.zip
+    python import.py --database structures.db --provider gnome \\
+        --gnome-local-dir gnome_data
 
     # Filter to materials containing these elements
     python import.py --database structures.db --provider mp --elements Fe Co
@@ -54,16 +64,23 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# One BLAS thread per worker process: the workers already use every core,
+# and pymatgen's many tiny matrix operations slow down ~100x when each
+# worker's BLAS threads compete for them.
+for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
 from crystaldb import StructureDatabase
 from crystaldb.database import compress_cif
 from crystaldb.sources import (
-    NON_COMMERCIAL_LICENSES,
     SourceRecord,
     alexandria,
     alexandria_chunk,
     alexandria_chunks,
     chunk_records,
     get_source,
+    gnome_chunk,
+    gnome_rows,
     materials_project,
 )
 from crystaldb.surfaces import PBE, SOURCE_GEOMETRY
@@ -92,9 +109,6 @@ _NOW = time.strftime("%Y-%m-%dT%H:%M:%S")
 def prepare(record: SourceRecord, source: str) -> Optional[Dict[str, Any]]:
     """A record as ready-to-insert values, computed off the main process."""
     from crystaldb.corrections import mp2020_correction
-
-    if record.license in NON_COMMERCIAL_LICENSES:
-        return {"source_id": record.source_id, "excluded_license": record.license}
 
     structure = record.structure
     composition = structure.composition
@@ -161,6 +175,11 @@ def prepare_alexandria_chunk(path: str, elements: Optional[List[str]]) -> List[D
     return prepare_batch(list(alexandria_chunk(Path(path), elements)), "alexandria")
 
 
+def prepare_gnome_rows(directory: str, rows: List[Dict[str, str]], elements: Optional[List[str]]) -> List[Dict[str, Any]]:
+    """Some GNoME summary rows, their CIFs parsed and prepared in a worker."""
+    return prepare_batch(list(gnome_chunk(Path(directory), rows, elements)), "gnome")
+
+
 # A refreshed record whose PBE energy moved by more than this (eV/atom), or
 # whose cell size changed, is a different structure from the stored one.
 CHANGED_ENERGY_EV = 1e-4
@@ -203,18 +222,14 @@ def write(
     rows,
     seen: Optional[set] = None,
 ) -> Dict[str, int]:
-    """Insert prepared rows in bulk: new structures, refreshed ones, retired ones."""
+    """Insert prepared rows in bulk: new structures and refreshed ones."""
     conn = db.conn
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
-    retired, new, refreshed, changed = [], [], [], []
+    new, refreshed, changed = [], [], []
     for row in rows:
         if seen is not None:
             seen.add(row["source_id"])
         old = existing.get(row["source_id"])
-        if "excluded_license" in row:
-            if old is not None:
-                retired.append((f"license {row['excluded_license']}", now, old.id))
-            continue
         if old is None:
             sid = str(uuid.uuid4())
             existing[row["source_id"]] = Existing(sid, row["num_atoms"], row["energy_per_atom"])
@@ -225,10 +240,6 @@ def write(
                 changed.append((old.id,))
             existing[row["source_id"]] = Existing(old.id, row["num_atoms"], row["energy_per_atom"])
 
-    conn.executemany(
-        "UPDATE structures SET is_valid = 0, error_message = ?, updated_at = ? WHERE id = ?",
-        retired,
-    )
     conn.executemany(
         """
         INSERT INTO structures (
@@ -309,12 +320,13 @@ def write(
         "new": len(new),
         "updated": len(refreshed),
         "changed": len(changed),
-        "excluded": len(retired),
     }
 
 
 def retire_missing(db: StructureDatabase, source: str, existing: Dict[str, Existing], seen: set) -> int:
-    """Retire this source's records that the import did not see."""
+    """Retire this source's records that the import did not see. Records
+    retired earlier for their license (before non-commercial data was kept)
+    and still not importable get this reason instead."""
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     gone = [
         ("no longer published by the source", now, old.id)
@@ -323,7 +335,7 @@ def retire_missing(db: StructureDatabase, source: str, existing: Dict[str, Exist
     ]
     db.conn.executemany(
         "UPDATE structures SET is_valid = 0, error_message = ?, updated_at = ? "
-        "WHERE id = ? AND is_valid = 1",
+        "WHERE id = ? AND (is_valid = 1 OR error_message LIKE 'license %')",
         gone,
     )
     db.conn.commit()
@@ -333,10 +345,14 @@ def retire_missing(db: StructureDatabase, source: str, existing: Dict[str, Exist
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--database", required=True)
-    parser.add_argument("--provider", choices=["mp", "alexandria"], default="mp")
+    parser.add_argument("--provider", choices=["mp", "alexandria", "gnome"], default="mp")
     parser.add_argument("--api-key", type=str, default=None, help="Materials Project API key")
     parser.add_argument("--alexandria-local-dir", type=str, default=None)
     parser.add_argument("--alexandria-local-pattern", type=str, default="alexandria_*.json.bz2")
+    parser.add_argument(
+        "--gnome-local-dir", type=str, default=None,
+        help="Directory with GNoME's stable_materials_summary.csv and by_id.zip",
+    )
     parser.add_argument("--elements", type=str, nargs="+", default=None)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--batch", type=int, default=1000)
@@ -349,8 +365,6 @@ def main():
     args = parser.parse_args()
 
     source = args.provider
-    if get_source(source).license in NON_COMMERCIAL_LICENSES:
-        parser.error(f"{source} is licensed {get_source(source).license}; Ouro's routes are paid")
     partial = bool(args.elements) or (
         source == "alexandria" and args.alexandria_local_pattern != "alexandria_*.json.bz2"
     )
@@ -361,6 +375,15 @@ def main():
         if not api_key:
             parser.error("Set MP_API_KEY or pass --api-key")
         records = materials_project(api_key, elements=args.elements)
+    elif source == "gnome":
+        if not args.gnome_local_dir:
+            parser.error("provider=gnome requires --gnome-local-dir")
+        gnome_table = gnome_rows(Path(args.gnome_local_dir))
+        records = (
+            record
+            for start in range(0, len(gnome_table), args.batch)
+            for record in gnome_chunk(Path(args.gnome_local_dir), gnome_table[start : start + args.batch], args.elements)
+        )
     else:
         if not args.alexandria_local_dir:
             parser.error("provider=alexandria requires --alexandria-local-dir")
@@ -385,7 +408,7 @@ def main():
         db.close()
         return
 
-    totals = {"new": 0, "updated": 0, "changed": 0, "excluded": 0}
+    totals = {"new": 0, "updated": 0, "changed": 0}
     started = time.time()
     with Pool(args.workers) as pool:
         pending = deque()
@@ -409,6 +432,15 @@ def main():
                 )
                 if len(pending) >= args.workers:
                     drain_one()
+        elif source == "gnome":
+            # Rows go to workers, which read their CIFs from the zip.
+            for start in range(0, len(gnome_table), args.batch):
+                rows = gnome_table[start : start + args.batch]
+                pending.append(
+                    pool.apply_async(prepare_gnome_rows, (args.gnome_local_dir, rows, args.elements))
+                )
+                if len(pending) >= args.workers * 2:
+                    drain_one()
         else:
             for batch in chunk_records(records, args.batch):
                 pending.append(pool.apply_async(prepare_batch, (batch, source)))
@@ -431,8 +463,7 @@ def main():
     logger.info("")
     logger.info(
         f"Done: {totals['new']:,} new, {totals['updated']:,} refreshed "
-        f"({totals['changed']:,} with a changed structure), "
-        f"{totals['excluded']:,} left out for their license, {retired:,} retired as gone "
+        f"({totals['changed']:,} with a changed structure), {retired:,} retired as gone "
         f"in {time.time() - started:.0f}s"
     )
     logger.info(

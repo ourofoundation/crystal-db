@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 from pymatgen.core import Structure
 
-from .sources import SOURCES, is_published
+from .sources import SOURCES, is_non_commercial, is_published
 
 if TYPE_CHECKING:
     from .database import StoredStructure, StructureDatabase
@@ -103,6 +103,12 @@ class Match:
     formula: str
     space_group_number: Optional[int]
     rms_distance: float
+    # The record's license (``crystaldb.sources.record_license``).
+    license: Optional[str] = None
+
+    @property
+    def non_commercial(self) -> bool:
+        return is_non_commercial(self.license)
 
 
 @dataclass
@@ -117,6 +123,7 @@ class Candidate:
     cif: str
     # Sites in the stored cell, a multiple of the primitive cell's.
     num_atoms: Optional[int] = None
+    license: Optional[str] = None
     _primitive: Optional[Structure] = field(default=None, repr=False)
 
     def primitive(self) -> Optional[Structure]:
@@ -150,15 +157,23 @@ def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[
                     formula=candidate.formula,
                     space_group_number=candidate.space_group_number,
                     rms_distance=rms,
+                    license=candidate.license,
                 )
             )
     # Equally close matches (polymorph duplicates within float noise) keep a
-    # fixed order, whatever order the candidates were read in: by source as
-    # crystaldb.sources lists them (Materials Project first), then by id.
+    # fixed order, whatever order the candidates were read in: commercially
+    # licensed first, by source as crystaldb.sources lists them (Materials
+    # Project first), then by id.
     rank = {source: i for i, source in enumerate(SOURCES)}
     return sorted(
         matches,
-        key=lambda m: (round(m.rms_distance, 4), rank.get(m.source, len(rank)), m.source_id or "", m.structure_id),
+        key=lambda m: (
+            round(m.rms_distance, 4),
+            m.non_commercial,
+            rank.get(m.source, len(rank)),
+            m.source_id or "",
+            m.structure_id,
+        ),
     )
 
 

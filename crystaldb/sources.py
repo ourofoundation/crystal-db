@@ -3,8 +3,8 @@
 ``SOURCES`` lists every provenance a structure in the database can have, the
 way ``crystaldb.surfaces`` lists energy surfaces. Three kinds:
 
-- ``published``: reference data (Materials Project, Alexandria). Prior art
-  for novelty checks, with a license, a label and a link.
+- ``published``: reference data (Materials Project, Alexandria, GNoME).
+  Prior art for novelty checks, with a license, a label and a link.
 - ``user``: structures people submitted to Ouro's routes (``ouro``).
 - ``generated``: structures a generator made on Ouro (GGen, Matra-Genoa).
 
@@ -19,15 +19,27 @@ The readers yield ``SourceRecord``s: a structure as published, with the raw
 the run settings and its own MP2020 correction. ``scripts/import.py`` writes
 records into the database as source geometries and ``pbe`` calculations, so
 adding a dataset means a registry entry plus one iterator here.
+
+Some data is licensed for non-commercial use only: all of GNoME, and the
+Materials Project records MP tags "BY-NC" (its GNoME-derived ones). It is
+stored like any other, and marked by its license (the source's, or the
+record's in ``metadata.license``). Ouro's paid routes never read it: a
+shared database copy leaves it out unless it is opened for free routes
+(``crystaldb.ouro.OuroSharedDatabase(non_commercial=True)``), and a copy
+that includes it never stores hull distances it shaped on other structures.
+``non_commercial_sql`` is the one test, in SQL for both stores.
 """
 
 from __future__ import annotations
 
 import bz2
+import csv
 import gc
 import json
 import logging
+import zipfile
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
@@ -84,6 +96,15 @@ SOURCES: Dict[str, Source] = {
             doi="10.1002/adma.202210788",
             hull_key="alexandria_e_above_hull",
         ),
+        Source(
+            "gnome",
+            PUBLISHED,
+            "GNoME",
+            license="CC-BY-NC-4.0",
+            home_url="https://github.com/google-deepmind/materials_discovery",
+            doi="10.1038/s41586-023-06735-9",
+            hull_key="gnome_e_above_hull",
+        ),
         Source("ggen", GENERATED, "GGen"),
         Source("matra-genoa", GENERATED, "Matra-Genoa"),
         Source("ouro", USER, "Ouro submission"),
@@ -95,10 +116,51 @@ USER_SOURCE = "ouro"
 # mistaken for published data.
 PUBLISHED_SOURCES = tuple(s.id for s in SOURCES.values() if s.kind == PUBLISHED)
 
-# Licenses we do not import, per source or per record: Ouro's routes are
-# paid, and this data is licensed for non-commercial use only. Materials
-# Project tags its GNoME-derived records "BY-NC".
-NON_COMMERCIAL_LICENSES = {"BY-NC", "CC-BY-NC-4.0", "CC-BY-NC-SA-4.0"}
+# Licenses that allow non-commercial use only. Ouro's paid routes must not
+# use data under them (see the module docstring). Materials Project tags its
+# GNoME-derived records "BY-NC" (and the rest "BY-C").
+NON_COMMERCIAL_LICENSES = ("BY-NC", "CC-BY-NC-4.0", "CC-BY-NC-SA-4.0")
+
+
+def is_non_commercial(license: Optional[str]) -> bool:
+    return license in NON_COMMERCIAL_LICENSES
+
+
+def non_commercial_sources() -> List[str]:
+    """Sources whose every record is licensed non-commercially."""
+    return sorted(s.id for s in SOURCES.values() if is_non_commercial(s.license))
+
+
+def _quoted(values: Sequence[str]) -> str:
+    return ", ".join("'" + value.replace("'", "''") + "'" for value in values)
+
+
+def non_commercial_sql(alias: str = "s", dialect: str = "sqlite") -> str:
+    """A SQL condition, true for structures (table alias ``alias``) licensed
+    non-commercially: from such a source, or with such a license in their
+    metadata. Never NULL, so ``NOT`` of it is safe. ``dialect`` is
+    ``sqlite`` (a local copy) or ``postgres`` (the shared datasets)."""
+    if dialect == "postgres":
+        license = f"COALESCE({alias}.metadata->>'license', '')"
+    else:
+        license = f"COALESCE(json_extract({alias}.metadata, '$.license'), '')"
+    condition = f"{license} IN ({_quoted(NON_COMMERCIAL_LICENSES)})"
+    sources = non_commercial_sources()
+    if sources:
+        condition = f"({alias}.source IN ({_quoted(sources)}) OR {condition})"
+    return condition
+
+
+# Materials Project's own license tags, as SPDX ids.
+SPDX_LICENSES = {"BY-C": "CC-BY-4.0", "BY-NC": "CC-BY-NC-4.0"}
+
+
+def record_license(source: Optional[str], license: Optional[str] = None) -> Optional[str]:
+    """A stored structure's license as an SPDX id: the record's own
+    (``metadata.license``) when the source sets one per record, else the
+    source's."""
+    license = license or get_source(source).license
+    return SPDX_LICENSES.get(license, license)
 
 
 def get_source(source: Optional[str]) -> Source:
@@ -133,7 +195,7 @@ class SourceRecord:
     correction_per_atom: Optional[float] = None
     parameters: Optional[Dict[str, Any]] = None
     # The source's license for this record when it varies per record
-    # (Materials Project tags GNoME-derived data "BY-NC").
+    # (Materials Project's "BY-C" / "BY-NC").
     license: Optional[str] = None
     space_group_number: Optional[int] = None
     space_group_symbol: Optional[str] = None
@@ -149,11 +211,10 @@ class SourceRecord:
 _SITE_BINS = [(1, 10), (11, 20), (21, 40), (41, 80), (81, 100000)]
 
 
-def _mp_summary(mpr, elements: Optional[Sequence[str]]):
-    """All materials' chemical systems, and the ids MP licenses non-commercially."""
-    fields = ["material_id", "chemsys", "builder_meta"]
+def _mp_summary(mpr, elements: Optional[Sequence[str]]) -> List[str]:
+    """All materials' chemical systems."""
+    fields = ["material_id", "chemsys"]
     systems: set = set()
-    non_commercial = []
     seen = 0
     for n in range(1, 10):
         for sites in _SITE_BINS:
@@ -163,16 +224,9 @@ def _mp_summary(mpr, elements: Optional[Sequence[str]]):
             for doc in mpr.materials.summary.search(**kwargs):
                 seen += 1
                 systems.add(doc.chemsys)
-                license = getattr(getattr(doc, "builder_meta", None), "license", None)
-                license = str(getattr(license, "value", license)) if license else None
-                if license in NON_COMMERCIAL_LICENSES:
-                    non_commercial.append((str(doc.material_id), license))
         logger.info(f"  MP summary: {seen:,} materials through {n} elements")
-    logger.info(
-        f"Materials Project: {seen:,} materials in {len(systems):,} systems, "
-        f"{len(non_commercial):,} licensed non-commercially"
-    )
-    return sorted(systems), non_commercial
+    logger.info(f"Materials Project: {seen:,} materials in {len(systems):,} systems")
+    return sorted(systems)
 
 
 def materials_project(
@@ -182,23 +236,16 @@ def materials_project(
 ) -> Iterator[SourceRecord]:
     """GGA/GGA+U entries from Materials Project's ``GGA_GGA+U`` thermo documents.
 
-    Materials only calculated with r2SCAN have no such entry and are skipped.
-    The energy and correction are MP's own (uncorrected energy plus the
-    MP2020 adjustment MP applied), on the GGA structure itself.
+    Materials only calculated with r2SCAN have no such entry and are skipped
+    (most of MP's GNoME-derived records; GNoME's own release has their PBE
+    energies). The energy and correction are MP's own (uncorrected energy
+    plus the MP2020 adjustment MP applied), on the GGA structure itself.
+    Each record carries MP's license for it, "BY-C" or "BY-NC".
     """
     from mp_api.client import MPRester
 
     with MPRester(api_key) as mpr:
-        all_systems, non_commercial = _mp_summary(mpr, elements)
-        # Records without a structure, so the importer retires earlier copies.
-        for material_id, license in non_commercial:
-            yield SourceRecord(
-                source="mp",
-                source_id=material_id,
-                structure=None,
-                energy_per_atom=None,
-                license=license,
-            )
+        all_systems = _mp_summary(mpr, elements)
         for start in range(0, len(all_systems), batch_size):
             systems = all_systems[start : start + batch_size]
             docs = mpr.materials.thermo.search(
@@ -213,10 +260,7 @@ def materials_project(
                     "energy_above_hull",
                 ],
             )
-            excluded = {material_id for material_id, _ in non_commercial}
             for doc in docs:
-                if str(doc.material_id) in excluded:
-                    continue
                 # The entry this thermo document's energy comes from.
                 entries = [e for e in (doc.entries or {}).values() if e is not None]
                 if not entries or doc.energy_per_atom is None:
@@ -327,6 +371,106 @@ def alexandria(
         logger.info(f"  {chunk.name}")
         yield from alexandria_chunk(chunk, elements)
         gc.collect()
+
+
+# -------------------- GNoME --------------------
+
+# GNoME's release (github.com/google-deepmind/materials_discovery): a summary
+# table and a zip of CIFs named by material id, downloaded from DeepMind's
+# public bucket (gs://gdm_materials_discovery/gnome_data/).
+GNOME_SUMMARY = "stable_materials_summary.csv"
+GNOME_STRUCTURES = "by_id.zip"
+
+# GNoME's pseudopotentials for these elements are not MP's, so its raw
+# energies sit this much higher per atom of the element (eV). DeepMind
+# publishes the values for shifting MP onto GNoME's scale; matched
+# structures confirm them against Alexandria's PBE (median Ge 0.104, Mg
+# 0.091, Ga -0.0025 per atom of the element; other systems agree to 2
+# meV/atom). The importer subtracts them, so GNoME shares MP's hull.
+GNOME_PSEUDOPOTENTIAL_SHIFT = {
+    "Ga": -0.0028805,
+    "Ge": 0.10417085,
+    "Li": -0.00301278,
+    "Mg": 0.0924014,
+    "Na": -0.00447437,
+}
+
+
+def _float(value: Optional[str]) -> Optional[float]:
+    try:
+        return float(value) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def gnome_rows(directory: Path) -> List[Dict[str, str]]:
+    """The summary table's rows."""
+    with open(Path(directory) / GNOME_SUMMARY, newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _gnome_record(row: Dict[str, str], cif: str) -> Optional[SourceRecord]:
+    material_id = row.get("MaterialId")
+    energy = _float(row.get("Uncorrected Energy"))  # of the cell, eV
+    try:
+        structure = Structure.from_str(cif, fmt="cif")
+    except Exception:
+        return None
+    if not material_id or energy is None or len(structure) != int(row.get("NSites") or 0):
+        return None
+    composition = structure.composition
+    energy -= sum(
+        shift * composition[el] for el, shift in GNOME_PSEUDOPOTENTIAL_SHIFT.items() if el in composition
+    )
+    number = row.get("Space Group Number")
+    return SourceRecord(
+        source="gnome",
+        source_id=str(material_id),
+        structure=structure,
+        # MP2020 is recomputed on import from the raw energy, as for Alexandria.
+        energy_per_atom=energy / len(structure),
+        space_group_number=int(number) if number else None,
+        space_group_symbol=row.get("Space Group") or None,
+        metadata={
+            # Distance to GNoME's hull of all its entries with MP's and
+            # OQMD's (eV/atom), and to MP's alone.
+            "gnome_e_above_hull": _float(row.get("Decomposition Energy Per Atom All")),
+            "gnome_e_above_mp_hull": _float(row.get("Decomposition Energy Per Atom MP")),
+            "gnome_band_gap": _float(row.get("Bandgap")),
+            "gnome_dimensionality": row.get("Dimensionality Cheon") or None,
+        },
+    )
+
+
+@lru_cache(maxsize=1)
+def _gnome_archive(path: str):
+    """The CIF zip and its entry names by material id, opened once per
+    process: reading the index of 554k entries takes a second or two."""
+    archive = zipfile.ZipFile(path)
+    names = {Path(name).stem: name for name in archive.namelist() if name.upper().endswith(".CIF")}
+    return archive, names
+
+
+def gnome_chunk(
+    directory: Path, rows: Sequence[Dict[str, str]], elements: Optional[Sequence[str]] = None
+) -> Iterator[SourceRecord]:
+    """Records for some summary rows, their structures read from the zip."""
+    wanted = set(elements or [])
+    archive, names = _gnome_archive(str(Path(directory) / GNOME_STRUCTURES))
+    for row in rows:
+        if wanted and not wanted <= set(json.loads(row["Elements"].replace("'", '"'))):
+            continue
+        name = names.get(row.get("MaterialId", ""))
+        if name is None:
+            continue
+        record = _gnome_record(row, archive.read(name).decode())
+        if record is not None:
+            yield record
+
+
+def gnome(directory: Path, elements: Optional[Sequence[str]] = None) -> Iterator[SourceRecord]:
+    """GNoME's stable materials from the downloaded summary table and CIFs."""
+    yield from gnome_chunk(directory, gnome_rows(directory), elements)
 
 
 def chunk_records(records: Iterator[SourceRecord], size: int) -> Iterator[List[SourceRecord]]:

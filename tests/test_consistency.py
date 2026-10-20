@@ -189,7 +189,7 @@ def test_reimport_refreshes_rows_and_drops_stale_mlip_data(tmp_path):
         record("a1", supercell, -8.1, alexandria_e_above_hull=0.02),
         record("a2", bcc("Ni", 2.8), -5.0),
     ]), seen)
-    assert counts == {"new": 0, "updated": 2, "changed": 1, "excluded": 0}
+    assert counts == {"new": 0, "updated": 2, "changed": 1}
 
     s1 = db.get_structure(a1)
     assert s1.num_atoms == 4

@@ -59,7 +59,7 @@ from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Composition, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 
-from .sources import is_generated
+from .sources import is_generated, record_license
 from .surfaces import DEFAULT_SURFACE, SOURCE_GEOMETRY, get_surface
 
 if TYPE_CHECKING:
@@ -1425,7 +1425,7 @@ class StructureDatabase:
         rows = self.conn.execute(
             """
             SELECT s.id, s.source, s.source_id, s.formula, s.space_group_number,
-                s.num_atoms,
+                s.num_atoms, json_extract(s.metadata, '$.license') AS license,
                 COALESCE(
                     (SELECT g.cif FROM geometries g
                      WHERE g.structure_id = s.id AND g.kind = 'source'),
@@ -1446,6 +1446,7 @@ class StructureDatabase:
                 space_group_number=row["space_group_number"],
                 cif=decompress_cif(row["cif"]),
                 num_atoms=row["num_atoms"],
+                license=record_license(row["source"], row["license"]),
             )
             for row in rows
             if row["cif"] is not None

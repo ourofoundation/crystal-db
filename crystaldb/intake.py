@@ -2,7 +2,8 @@
 
 Every structure is matched against all stored structures of its reduced
 formula, published or made on Ouro (``crystaldb.matching``). A match is
-returned instead of a second copy; the database only grows by new crystals.
+returned instead of a second copy; the database only grows by new crystals,
+and by copies of non-commercial data, which paid routes cannot see.
 A structure resubmitted under the same ``(source, source_id)``, such as a
 user's file that was replaced, updates its own row.
 
@@ -136,7 +137,10 @@ def add_if_new(
         )
         status, match = UPDATED, None
     else:
-        candidates = [*novelty.matches, *novelty.ouro_matches]
+        # A copy of non-commercial data (GNoME, ...) is stored anyway: paid
+        # routes never see that data, so for them this is a new crystal. The
+        # match still shows in ``novelty``.
+        candidates = [m for m in (*novelty.matches, *novelty.ouro_matches) if not m.non_commercial]
         match = min(candidates, key=lambda m: m.rms_distance) if candidates else None
         if match is not None:
             sid = match.structure_id

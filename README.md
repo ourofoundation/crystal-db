@@ -2,7 +2,7 @@
 
 A crystal structure database in one SQLite file. It holds:
 
-- published reference structures (Materials Project, Alexandria)
+- published reference structures (Materials Project, Alexandria, GNoME)
 - structures made by generators
 - user submissions
 
@@ -29,7 +29,7 @@ index.check(structure).status  # "known", "new polymorph" or "new composition"
 | `crystaldb.database` | Schema, structures, geometries per slot, calculations per surface, hulls, shards (extract / export / merge) |
 | `crystaldb.surfaces` | Energy surfaces (PBE, Orb v3) |
 | `crystaldb.corrections` | MP2020, applied the same way on every surface |
-| `crystaldb.sources` | Source registry (published / generated / user) and readers for Materials Project and Alexandria |
+| `crystaldb.sources` | Source registry (published / generated / user) and readers for Materials Project, Alexandria and GNoME |
 | `crystaldb.matching` | Novelty: is a structure already published? |
 | `crystaldb.references` | Fills near-hull reference energies on an MLIP surface |
 | `crystaldb.intake` | Adds a structure only if no stored structure matches it |
@@ -62,6 +62,7 @@ Ouro keeps the database as five datasets, one per table (structures, geometries,
 
 - **Read:** `store.reader(systems=[...])` or `store.reader(formulas=[...])` fills a local `StructureDatabase` with those structures, their geometries, calculations and runs.
 - **Write:** `store.working_copy(systems)` does the same; on exit, everything the copy changed is upserted back. A new structure the datasets already hold under another id (the same `(source, source_id)`, or for generated structures the same `structure_hash`) is merged into that row. A stored row's identity fields only change when the copy changed them and is newer, so a copy taken before an import can't undo it. Stored hull distances the copy recomputed go back as updates of the hull columns alone, so they never overwrite an energy written meanwhile.
+- **Non-commercial data:** GNoME and Materials Project's "BY-NC" records are licensed for non-commercial use only. Copies leave them out unless the store is opened with `OuroSharedDatabase(..., non_commercial=True)`, which only free routes do. Such a copy never stores hull distances on other structures, because the non-commercial data shaped them, and `intake.add_if_new` still stores a structure that only matches non-commercial data. `sources.non_commercial_sql` is the one test, in SQLite and Postgres.
 - **Whole-database jobs:** `store.bulk_copy(sources=[...])` copies every structure from those sources (every structure when none are named), read in parallel key ranges, optionally without geometries or with only some surfaces. The scripts in `scripts/` run on it unchanged, and its changes are sent when the block succeeds. Ouro's Crystal DB service runs them as its `maintenance` job.
 
 ```python
@@ -97,7 +98,7 @@ Nothing needs registering. In a `working_copy([chemsys])`:
 
 ## Adding a published dataset
 
-1. **License first.** Records licensed in `NON_COMMERCIAL_LICENSES` aren't imported.
+1. **License first.** Set the source's `license`, or a per-record one in `SourceRecord.license`. Data licensed in `NON_COMMERCIAL_LICENSES` is imported but kept away from paid use (see below).
 2. Add a `Source(..., kind=PUBLISHED, license=..., url=..., hull_key=...)` to `SOURCES`.
 3. Write a reader yielding `SourceRecord`s: the raw PBE energy per atom on the published cell, and the source's own hull distance in metadata under `hull_key`.
 4. Add the provider to `scripts/import.py`. A re-import refreshes rows in place, and `--retire-missing` retires records the source no longer publishes.
@@ -109,4 +110,4 @@ Add a `Surface` to `SURFACES` and fill its energies near the PBE hull. Callers f
 
 ## License
 
-MIT. Imported data keeps its own license: Materials Project and Alexandria are CC BY 4.0.
+MIT. Imported data keeps its own license: Materials Project and Alexandria are CC BY 4.0, except Materials Project's GNoME-derived records, which are CC BY-NC 4.0 like GNoME itself ([Merchant et al. 2023](https://doi.org/10.1038/s41586-023-06735-9)).
