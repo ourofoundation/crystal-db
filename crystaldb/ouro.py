@@ -885,6 +885,8 @@ def _snapshot_hulls(db: StructureDatabase) -> None:
     db.conn.execute(
         f"CREATE TABLE _filled_hulls AS SELECT structure_id, surface, {columns} FROM calculations"
     )
+    # Looked up per calculation when the copy's changes are sent.
+    db.conn.execute("CREATE UNIQUE INDEX _filled_hulls_key ON _filled_hulls (structure_id, surface)")
     db._commit()
 
 
