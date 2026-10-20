@@ -49,6 +49,9 @@ class Source:
     license: Optional[str] = None
     # Page for one record, formatted with ``id`` (the record's source_id).
     url: Optional[str] = None
+    # The source's home page, and the paper to cite for its data.
+    home_url: Optional[str] = None
+    doi: Optional[str] = None
     # Key in ``structures.metadata`` holding the source's own distance to
     # its hull (eV/atom), stored on import; see scripts/published_hulls.py.
     hull_key: Optional[str] = None
@@ -68,6 +71,8 @@ SOURCES: Dict[str, Source] = {
             short_label="MP",
             license="CC-BY-4.0",
             url="https://next-gen.materialsproject.org/materials/{id}",
+            home_url="https://next-gen.materialsproject.org",
+            doi="10.1063/1.4812323",
             hull_key="mp_energy_above_hull",
         ),
         Source(
@@ -75,6 +80,8 @@ SOURCES: Dict[str, Source] = {
             PUBLISHED,
             "Alexandria",
             license="CC-BY-4.0",
+            home_url="https://alexandria.icams.rub.de",
+            doi="10.1002/adma.202210788",
             hull_key="alexandria_e_above_hull",
         ),
         Source("ggen", GENERATED, "GGen"),
