@@ -236,7 +236,6 @@ class OuroSharedDatabase:
         key column (a uuid), several ranges at once; pages come in no
         particular order."""
         column = f"t.{PRIMARY_KEYS[table][0]}"
-        bounds = [None, *(f"{digit:x}0000000-0000-0000-0000-000000000000" for digit in range(1, KEY_RANGES)), None]
         pages: "queue.Queue[Any]" = queue.Queue(maxsize=RANGE_REQUESTS * 2)
         done = object()
 
@@ -252,10 +251,11 @@ class OuroSharedDatabase:
             finally:
                 pages.put(done)
 
+        ranges = _key_ranges()
         with ThreadPoolExecutor(max_workers=RANGE_REQUESTS) as pool:
-            for low, high in zip(bounds, bounds[1:]):
+            for low, high in ranges:
                 pool.submit(read, low, high)
-            remaining = len(bounds) - 1
+            remaining = len(ranges)
             try:
                 while remaining:
                     item = pages.get()
@@ -809,24 +809,48 @@ class OuroSharedDatabase:
         """Valid structures per source, in the shape of
         ``StructureDatabase.source_counts`` (no import times). Counting reads
         the whole table, so a count is reused for ``max_age`` seconds, and a
-        caller arriving while one runs waits for it."""
+        caller arriving while one runs waits for it. Counts are a summary,
+        so when counting fails the last ones (or none) are returned."""
         with self._counting:
             cached = self._counts
             if cached is not None and time.time() - cached[0] < max_age:
                 return cached[1]
-            return self._count_sources()
+            try:
+                return self._count_sources()
+            except OuroError:
+                logger.exception("Could not count structures per source")
+                return cached[1] if cached is not None else {}
 
     def _count_sources(self) -> Dict[str, Dict[str, Any]]:
+        """One count per key range, several at once: a single count of
+        millions of rows outlasts the read endpoint's statement timeout."""
         where = "t.is_valid"
         if not self.non_commercial:
             where += f" AND NOT {non_commercial_sql('t', 'postgres')}"
-        rows = self.query(
-            f"SELECT t.source, count(*) AS n FROM {self.table('structures')} t "
-            f"WHERE {where} GROUP BY t.source"
-        )
-        counts = {row["source"]: {"structures": row["n"], "imported_at": None} for row in rows}
+        table = self.table("structures")
+
+        def count(bounds: Tuple[Optional[str], Optional[str]]) -> List[Dict[str, Any]]:
+            low, high = bounds
+            limits = [f"t.id >= {_literal(low)}"] if low else []
+            limits += [f"t.id < {_literal(high)}"] if high else []
+            condition = " AND ".join([where, *limits])
+            return self.query(f"SELECT t.source, count(*) AS n FROM {table} t WHERE {condition} GROUP BY t.source")
+
+        totals: Dict[str, int] = {}
+        with ThreadPoolExecutor(max_workers=RANGE_REQUESTS) as pool:
+            for rows in pool.map(count, _key_ranges()):
+                for row in rows:
+                    totals[row["source"]] = totals.get(row["source"], 0) + int(row["n"])
+        counts = {source: {"structures": n, "imported_at": None} for source, n in totals.items()}
         self._counts = (time.time(), counts)
         return counts
+
+
+def _key_ranges() -> List[Tuple[Optional[str], Optional[str]]]:
+    """KEY_RANGES (low, high) bounds splitting uuid keys by their first hex
+    digit; None is open."""
+    bounds = [None, *(f"{digit:x}0000000-0000-0000-0000-000000000000" for digit in range(1, KEY_RANGES)), None]
+    return list(zip(bounds, bounds[1:]))
 
 
 # -------------------- Hull distances --------------------
