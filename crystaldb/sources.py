@@ -37,6 +37,7 @@ import csv
 import gc
 import json
 import logging
+import math
 import zipfile
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -397,10 +398,18 @@ GNOME_PSEUDOPOTENTIAL_SHIFT = {
 
 
 def _float(value: Optional[str]) -> Optional[float]:
+    """A finite number, or None (the table has nan and inf band gaps,
+    which JSON cannot carry)."""
     try:
-        return float(value) if value not in (None, "") else None
+        number = float(value) if value not in (None, "") else None
     except ValueError:
         return None
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _text(value: Optional[str]) -> Optional[str]:
+    value = (value or "").strip()
+    return value if value and value.lower() != "nan" else None
 
 
 def gnome_rows(directory: Path) -> List[Dict[str, str]]:
@@ -437,7 +446,7 @@ def _gnome_record(row: Dict[str, str], cif: str) -> Optional[SourceRecord]:
             "gnome_e_above_hull": _float(row.get("Decomposition Energy Per Atom All")),
             "gnome_e_above_mp_hull": _float(row.get("Decomposition Energy Per Atom MP")),
             "gnome_band_gap": _float(row.get("Bandgap")),
-            "gnome_dimensionality": row.get("Dimensionality Cheon") or None,
+            "gnome_dimensionality": _text(row.get("Dimensionality Cheon")),
         },
     )
 

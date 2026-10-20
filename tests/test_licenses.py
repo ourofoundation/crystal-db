@@ -147,7 +147,7 @@ def test_gnome_reader_shifts_energies_onto_mp_pseudopotentials(tmp_path):
         writer = csv.writer(handle)
         writer.writerow(header)
         writer.writerow([0, "Fe1Mg1", "aaaa000001", "['Mg', 'Fe']", 2, "Pm-3m", 221, -10.0, -10.0, 0.0, -0.01, 0.0, "3D"])
-        writer.writerow([1, "Fe2", "aaaa000002", "['Fe']", 2, "Im-3m", 229, -16.6, -16.6, 0.0, 0.0, "", "3D"])
+        writer.writerow([1, "Fe2", "aaaa000002", "['Fe']", 2, "Im-3m", 229, -16.6, -16.6, 0.0, 0.0, "inf", "nan"])
         writer.writerow([2, "Fe2", "aaaa000003", "['Fe']", 2, "Im-3m", 229, -16.0, -16.0, 0.0, 0.0, "", "3D"])
     with zipfile.ZipFile(tmp_path / "by_id.zip", "w") as archive:
         archive.writestr("by_id/aaaa000001.CIF", mg.to(fmt="cif"))
@@ -159,4 +159,7 @@ def test_gnome_reader_shifts_energies_onto_mp_pseudopotentials(tmp_path):
     assert records["aaaa000002"].energy_per_atom == pytest.approx(-8.3)
     assert records["aaaa000001"].metadata["gnome_e_above_hull"] == 0.0
     assert records["aaaa000001"].space_group_number == 221
+    # Non-finite values are left out: JSON cannot carry them.
+    assert records["aaaa000002"].metadata["gnome_band_gap"] is None
+    assert records["aaaa000002"].metadata["gnome_dimensionality"] is None
     assert [r.source_id for r in gnome(tmp_path, elements=["Mg"])] == ["aaaa000001"]
