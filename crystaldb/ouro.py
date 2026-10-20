@@ -373,11 +373,13 @@ class OuroSharedDatabase:
 
         started = time.time()
         held: Dict[str, str] = {}
-        where = "TRUE" if everything else " OR ".join(
+        # One read per selector: together they can outgrow the API's 100 kB
+        # request body (twenty chunks of a thousand ids are ~800 kB).
+        wheres = ["TRUE"] if everything else [
             f"t.{column} IN ({_literals(values)})" for column, values in selectors
-        )
+        ]
         if not self.non_commercial:
-            where = f"({where}) AND NOT {non_commercial_sql('t', 'postgres')}"
+            wheres = [f"({where}) AND NOT {non_commercial_sql('t', 'postgres')}" for where in wheres]
         children = {"calculations": "TRUE"}
         if runs:
             children["run_structures"] = "TRUE"
@@ -413,12 +415,17 @@ class OuroSharedDatabase:
                     lookups[pool.submit(self.query, sql)] = table
 
         try:
-            for rows in (self._ranged_pages if bulk else self._pages)("structures", "t.*", where):
-                self._insert(db, "structures", rows, commit=bulk)
-                held.update((row["id"], row["updated_at"]) for row in rows)
-                if not bulk:
-                    # Children are looked up while further pages arrive.
-                    look_up_children(rows)
+            for where in wheres:
+                for rows in (self._ranged_pages if bulk else self._pages)("structures", "t.*", where):
+                    # A structure two selectors match is read once.
+                    rows = [row for row in rows if row["id"] not in held]
+                    if not rows:
+                        continue
+                    self._insert(db, "structures", rows, commit=bulk)
+                    held.update((row["id"], row["updated_at"]) for row in rows)
+                    if not bulk:
+                        # Children are looked up while further pages arrive.
+                        look_up_children(rows)
             counts["structures"] = len(held)
             if bulk and len(held) > BULK_CHILDREN:
                 # Most of the database: read the child tables whole by key

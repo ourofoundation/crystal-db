@@ -337,3 +337,14 @@ def test_gateway_errors_are_retried(fake, monkeypatch):
     failures[:] = [502, 502, 502]
     with pytest.raises(module.OuroError, match="502"):
         store.query(f"SELECT count(*) AS n FROM {store.table('structures')}")
+
+
+def test_a_copy_of_many_ids_reads_them_in_requests_the_api_takes(fake):
+    import uuid
+
+    store = OuroSharedDatabase(fake, fake.ids)
+    wanted = [fake.db.get_structure_by_source("mp", "mp-13").id] + [str(uuid.uuid4()) for _ in range(5000)]
+    # Five thousand ids in one query would be ~200 kB; the fake refuses
+    # bodies over 100 kB, as the API does.
+    with store.working_copy(structure_ids=wanted) as db:
+        assert [row[0] for row in db.conn.execute("SELECT source_id FROM structures")] == ["mp-13"]

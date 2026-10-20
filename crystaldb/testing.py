@@ -15,6 +15,7 @@ setting up and inspecting what the server holds.
 from __future__ import annotations
 
 import json
+import json as _json
 import re
 import sqlite3
 import threading
@@ -80,7 +81,12 @@ class FakeOuro:
         with self.lock:
             return self._post(path, json)
 
+    # The API refuses request bodies over 100 kB.
+    MAX_BODY = 100_000
+
     def _post(self, path, json):
+        if len(_json.dumps(json)) > self.MAX_BODY:
+            return Response({"error": {"message": "Payload Too Large"}}, 413)
         if path.endswith("/query-custom"):
             self.queries += 1
             sql = re.sub(r'datasets\."dataset_(\w+)"', r"\1", json["query"])
