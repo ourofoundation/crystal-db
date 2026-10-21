@@ -230,6 +230,25 @@ def test_novelty(db):
     assert index.classify(mp) == REFERENCE
 
 
+def test_novelty_says_whether_a_match_was_observed(db):
+    add(db, b2("Fe", "Ni"), None, source="mp", source_id="mp-2",
+        generation_metadata={"experimental": True, "icsd_ids": [103556, 52266]})
+    add(db, b2("Fe", "Co"), None, source="mp", source_id="mp-3",
+        generation_metadata={"experimental": False, "icsd_ids": []})
+    add(db, b2("Co", "Ni"), None, source="alexandria", source_id="agm1")
+    index = db.novelty_index()
+
+    observed = index.check(b2("Fe", "Ni"))
+    assert observed.experimental
+    assert observed.matches[0].experimental is True
+    assert observed.matches[0].icsd_ids == (103556, 52266)
+    theoretical = index.check(b2("Fe", "Co"))
+    assert theoretical.status == KNOWN and not theoretical.experimental
+    assert theoretical.matches[0].experimental is False
+    # Alexandria does not say.
+    assert index.check(b2("Co", "Ni")).matches[0].experimental is None
+
+
 def test_novelty_skips_candidates_of_another_size(db):
     add(db, b2("Fe", "Ni"), None, source="mp", source_id="mp-2")
     supercell = b2("Fe", "Ni")

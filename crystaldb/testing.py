@@ -6,7 +6,8 @@ endpoints the store uses the way the API does: read-only SQL returns rows
 with JSON columns parsed and flags as booleans, upserts replace rows by
 primary key, updates set the given columns of rows matched by key, and
 deletes remove rows by key. ``fake.db`` is a ``StructureDatabase`` on that file, for
-setting up and inspecting what the server holds.
+setting up and inspecting what the server holds; ``add_dataset`` adds
+another table (the COD dataset, say).
 
     fake = FakeOuro(tmp_path / "server.db")
     store = fake.store()
@@ -55,6 +56,15 @@ class FakeOuro:
         self.names = {self.ids[table]: table for table in TABLES}
         self.queries = 0
         self.client = self
+
+    def add_dataset(self, name: str, schema: str) -> str:
+        """Another dataset, as a table ``name`` created by ``schema``; its
+        rows are the server's ``name`` table. Returns its id."""
+        dataset_id = str(uuid.uuid4())
+        with self.lock:
+            self.server.executescript(schema)
+        self.names[dataset_id] = name
+        return dataset_id
 
     def get(self, path, **_):
         dataset_id = path.rsplit("/", 1)[-1]

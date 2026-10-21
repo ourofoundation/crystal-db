@@ -19,6 +19,8 @@ mp = ["mp-api>=0.45.8"]
 relax = ["torch-sim-atomistic>=0.6.0", "orb-models>=0.6.0", "ase>=3.22.0"]
 # Sharing the database as Ouro datasets (crystaldb.ouro)
 ouro = ["ouro-py>=2.9.0"]
+# Building the COD dataset (scripts/cod.py; rsync on the PATH too)
+cod = ["pymysql>=1.0", "pandas>=2.0"]
 dev = ["pytest>=7.0", "ase>=3.22.0"]
 
 [project.urls]

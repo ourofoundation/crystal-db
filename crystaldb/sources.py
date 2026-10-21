@@ -3,8 +3,10 @@
 ``SOURCES`` lists every provenance a structure in the database can have, the
 way ``crystaldb.surfaces`` lists energy surfaces. Three kinds:
 
-- ``published``: reference data (Materials Project, Alexandria, GNoME).
-  Prior art for novelty checks, with a license, a label and a link.
+- ``published``: reference data (Materials Project, Alexandria, GNoME, and
+  the Crystallography Open Database, which lives in its own dataset; see
+  ``crystaldb.cod``). Prior art for novelty checks, with a license, a label
+  and a link.
 - ``user``: structures people submitted to Ouro's routes (``ouro``).
 - ``generated``: structures a generator made on Ouro (GGen, Matra-Genoa).
 
@@ -28,6 +30,10 @@ shared database copy leaves it out unless it is opened for free routes
 (``crystaldb.ouro.OuroSharedDatabase(non_commercial=True)``), and a copy
 that includes it never stores hull distances it shaped on other structures.
 ``non_commercial_sql`` is the one test, in SQL for both stores.
+
+Where a source says whether a record was observed experimentally, its
+metadata has ``experimental`` (true or false) and ``icsd_ids`` (ICSD
+collection codes, ids only). Materials Project is the one that does.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ import zipfile
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from pymatgen.core import Structure
 
@@ -105,6 +111,19 @@ SOURCES: Dict[str, Source] = {
             home_url="https://github.com/google-deepmind/materials_discovery",
             doi="10.1038/s41586-023-06735-9",
             hull_key="gnome_e_above_hull",
+        ),
+        # Experimental structures, kept in a dataset of their own rather
+        # than in the crystal DB's tables (they have no energies; see
+        # crystaldb.cod). Prior art for novelty checks all the same.
+        Source(
+            "cod",
+            PUBLISHED,
+            "Crystallography Open Database",
+            short_label="COD",
+            license="CC0-1.0",
+            url="https://www.crystallography.net/cod/{id}.html",
+            home_url="https://www.crystallography.net/cod/",
+            doi="10.1107/S0021889809016690",
         ),
         Source("ggen", GENERATED, "GGen"),
         Source("matra-genoa", GENERATED, "Matra-Genoa"),
@@ -212,22 +231,49 @@ class SourceRecord:
 _SITE_BINS = [(1, 10), (11, 20), (21, 40), (41, 80), (81, 100000)]
 
 
-def _mp_summary(mpr, elements: Optional[Sequence[str]]) -> List[str]:
-    """All materials' chemical systems."""
-    fields = ["material_id", "chemsys"]
+@dataclass(frozen=True)
+class Provenance:
+    """Whether MP counts a material as experimentally observed, and the
+    ICSD entries it was matched to (MP's ``theoretical`` and
+    ``database_IDs``). MP calls a material theoretical even when its ICSD
+    ids are all for ICSD's own theoretical entries."""
+
+    experimental: bool
+    icsd_ids: Tuple[int, ...] = ()
+
+
+def _icsd_ids(database_ids: Optional[Dict[str, Any]]) -> Tuple[int, ...]:
+    ids = set()
+    for value in (database_ids or {}).get("icsd") or []:
+        digits = str(value).rsplit("-", 1)[-1]
+        if digits.isdigit():
+            ids.add(int(digits))
+    return tuple(sorted(ids))
+
+
+def _mp_summary(mpr, elements: Optional[Sequence[str]]) -> Tuple[List[str], Dict[str, Provenance]]:
+    """All materials' chemical systems, and each material's provenance."""
+    fields = ["material_id", "chemsys", "theoretical", "database_IDs"]
     systems: set = set()
-    seen = 0
+    provenance: Dict[str, Provenance] = {}
     for n in range(1, 10):
         for sites in _SITE_BINS:
             kwargs: Dict[str, Any] = {"num_elements": (n, n), "num_sites": sites, "fields": fields}
             if elements:
                 kwargs["elements"] = list(elements)
             for doc in mpr.materials.summary.search(**kwargs):
-                seen += 1
                 systems.add(doc.chemsys)
-        logger.info(f"  MP summary: {seen:,} materials through {n} elements")
-    logger.info(f"Materials Project: {seen:,} materials in {len(systems):,} systems")
-    return sorted(systems)
+                provenance[str(doc.material_id)] = Provenance(
+                    experimental=doc.theoretical is False,
+                    icsd_ids=_icsd_ids(doc.database_IDs),
+                )
+        logger.info(f"  MP summary: {len(provenance):,} materials through {n} elements")
+    experimental = sum(p.experimental for p in provenance.values())
+    logger.info(
+        f"Materials Project: {len(provenance):,} materials ({experimental:,} experimental) "
+        f"in {len(systems):,} systems"
+    )
+    return sorted(systems), provenance
 
 
 def materials_project(
@@ -241,12 +287,15 @@ def materials_project(
     (most of MP's GNoME-derived records; GNoME's own release has their PBE
     energies). The energy and correction are MP's own (uncorrected energy
     plus the MP2020 adjustment MP applied), on the GGA structure itself.
-    Each record carries MP's license for it, "BY-C" or "BY-NC".
+    Each record carries MP's license for it, "BY-C" or "BY-NC", and in its
+    metadata whether MP counts it as experimentally observed
+    (``experimental``) and the ICSD entries MP matched it to (``icsd_ids``).
+    The ids are references only: no ICSD data is read.
     """
     from mp_api.client import MPRester
 
     with MPRester(api_key) as mpr:
-        all_systems = _mp_summary(mpr, elements)
+        all_systems, provenance = _mp_summary(mpr, elements)
         for start in range(0, len(all_systems), batch_size):
             systems = all_systems[start : start + batch_size]
             docs = mpr.materials.thermo.search(
@@ -271,6 +320,7 @@ def materials_project(
                     continue
                 symmetry = doc.symmetry
                 license = getattr(getattr(doc, "builder_meta", None), "license", None)
+                origin = provenance.get(str(doc.material_id))
                 yield SourceRecord(
                     source="mp",
                     source_id=str(doc.material_id),
@@ -288,6 +338,11 @@ def materials_project(
                     metadata={
                         "mp_entry_id": str(entry.entry_id),
                         "mp_energy_above_hull": doc.energy_above_hull,
+                        **(
+                            {"experimental": origin.experimental, "icsd_ids": list(origin.icsd_ids)}
+                            if origin
+                            else {}
+                        ),
                     },
                 )
 

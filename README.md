@@ -52,9 +52,21 @@ Scripts in `scripts/` maintain a database:
 
 `crystaldb.sources.SOURCES` lists every provenance a structure can have.
 
-- **Published sources** are prior art: the novelty check matches against them, and they carry a license and a link.
+- **Published sources** are prior art: the novelty check matches against them, and they carry a license and a link. A record whose source says whether it was observed experimentally carries `experimental` (true or false) and `icsd_ids` (ICSD collection codes) in its metadata, and novelty matches report both. Materials Project sets them from its `theoretical` flag and `database_IDs`; only ICSD ids are stored, never ICSD data.
 - **Any other source** counts as generated: its structures are never prior art, and its P1 structures (mostly symmetry-broken leftovers) can be left out of hulls. A new generator can save structures under its own source name without a release of this package.
 - **`ouro`** marks user submissions.
+
+## The Crystallography Open Database
+
+COD's experimental structures (CC0) are prior art too, but they have no energies, so they live in a public Ouro dataset of their own rather than in the database's tables: one row per COD entry, with COD's metadata for every entry and the CIF for inorganic ones (`crystaldb.cod`). `scripts/cod.py build` reads COD's metadata from its SQL server, mirrors the inorganic CIFs with rsync and parses them; `scripts/cod.py publish` creates the dataset or refreshes it by upserting on the COD id. Novelty checks match against it when given its candidates:
+
+```python
+from crystaldb.cod import CodDataset
+
+cod = CodDataset(ouro, "<dataset id>")
+result = db.novelty_index(extra=[cod.candidates]).check(structure)
+result.experimental  # a match was observed experimentally
+```
 
 ## Sharing one database between apps
 
@@ -100,7 +112,7 @@ Nothing needs registering. In a `working_copy([chemsys])`:
 
 1. **License first.** Set the source's `license`, or a per-record one in `SourceRecord.license`. Data licensed in `NON_COMMERCIAL_LICENSES` is imported but kept away from paid use (see below).
 2. Add a `Source(..., kind=PUBLISHED, license=..., url=..., hull_key=...)` to `SOURCES`.
-3. Write a reader yielding `SourceRecord`s: the raw PBE energy per atom on the published cell, and the source's own hull distance in metadata under `hull_key`.
+3. Write a reader yielding `SourceRecord`s: the raw PBE energy per atom on the published cell, and the source's own hull distance in metadata under `hull_key`. Set `experimental` and `icsd_ids` in metadata when the source records them.
 4. Add the provider to `scripts/import.py`. A re-import refreshes rows in place, and `--retire-missing` retires records the source no longer publishes.
 5. Run `scripts/published_hulls.py`, then single-points near the PBE hull for each MLIP surface.
 

@@ -1426,6 +1426,8 @@ class StructureDatabase:
             """
             SELECT s.id, s.source, s.source_id, s.formula, s.space_group_number,
                 s.num_atoms, json_extract(s.metadata, '$.license') AS license,
+                json_extract(s.metadata, '$.experimental') AS experimental,
+                json_extract(s.metadata, '$.icsd_ids') AS icsd_ids,
                 COALESCE(
                     (SELECT g.cif FROM geometries g
                      WHERE g.structure_id = s.id AND g.kind = 'source'),
@@ -1447,16 +1449,19 @@ class StructureDatabase:
                 cif=decompress_cif(row["cif"]),
                 num_atoms=row["num_atoms"],
                 license=record_license(row["source"], row["license"]),
+                experimental=_bool_or_none(row["experimental"]),
+                icsd_ids=tuple(json.loads(row["icsd_ids"])) if row["icsd_ids"] else (),
             )
             for row in rows
             if row["cif"] is not None
         ]
 
-    def novelty_index(self) -> "NoveltyIndex":
-        """A NoveltyIndex over this database (see ``crystaldb.matching``)."""
+    def novelty_index(self, extra: Sequence[Callable[[str], List["Candidate"]]] = ()) -> "NoveltyIndex":
+        """A NoveltyIndex over this database (see ``crystaldb.matching``),
+        with candidates from ``extra`` too (``crystaldb.cod``)."""
         from .matching import NoveltyIndex
 
-        return NoveltyIndex(self)
+        return NoveltyIndex(self, extra)
 
     # -------------------- Run Management --------------------
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pymatgen.core import Structure
 
@@ -105,6 +105,10 @@ class Match:
     rms_distance: float
     # The record's license (``crystaldb.sources.record_license``).
     license: Optional[str] = None
+    # Whether the source counts it as experimentally observed (None when the
+    # source does not say), and the ICSD entries the source matched it to.
+    experimental: Optional[bool] = None
+    icsd_ids: Tuple[int, ...] = ()
 
     @property
     def non_commercial(self) -> bool:
@@ -123,7 +127,11 @@ class Candidate:
     cif: str
     # Sites in the stored cell, a multiple of the primitive cell's.
     num_atoms: Optional[int] = None
+    # Sites in its primitive cell (``primitive``), when known ahead of time.
+    primitive_atoms: Optional[int] = None
     license: Optional[str] = None
+    experimental: Optional[bool] = None
+    icsd_ids: Tuple[int, ...] = ()
     _primitive: Optional[Structure] = field(default=None, repr=False)
 
     def primitive(self) -> Optional[Structure]:
@@ -144,6 +152,8 @@ def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[
         # are ruled out without parsing them.
         if candidate.num_atoms and candidate.num_atoms % len(query):
             continue
+        if candidate.primitive_atoms and candidate.primitive_atoms != len(query):
+            continue
         other = candidate.primitive()
         if other is None:
             continue
@@ -158,6 +168,8 @@ def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[
                     space_group_number=candidate.space_group_number,
                     rms_distance=rms,
                     license=candidate.license,
+                    experimental=candidate.experimental,
+                    icsd_ids=candidate.icsd_ids,
                 )
             )
     # Equally close matches (polymorph duplicates within float noise) keep a
@@ -188,6 +200,11 @@ class NoveltyResult:
     # Structures with the same reduced formula, by source.
     same_formula_counts: Dict[str, int]
 
+    @property
+    def experimental(self) -> bool:
+        """A match is a structure its source counts as experimentally observed."""
+        return any(m.experimental for m in self.matches)
+
 
 class NoveltyIndex:
     """Classifies structures against the database, one reduced formula at a time.
@@ -196,14 +213,24 @@ class NoveltyIndex:
     near-hull phase of a system costs one query per distinct formula.
     """
 
-    def __init__(self, db: "StructureDatabase"):
+    def __init__(
+        self,
+        db: "StructureDatabase",
+        extra: Sequence[Callable[[str], List[Candidate]]] = (),
+    ):
+        """``extra`` are further sources of candidates by reduced formula,
+        such as ``crystaldb.cod.CodDataset.candidates``."""
         self.db = db
+        self.extra = tuple(extra)
         self._cache: Dict[str, List[Candidate]] = {}
         self._labels: Dict[str, str] = {}
 
     def candidates(self, reduced_formula: str) -> List[Candidate]:
         if reduced_formula not in self._cache:
-            self._cache[reduced_formula] = self.db.get_match_candidates(reduced_formula)
+            found = self.db.get_match_candidates(reduced_formula)
+            for source in self.extra:
+                found = found + source(reduced_formula)
+            self._cache[reduced_formula] = found
         return self._cache[reduced_formula]
 
     def check(

@@ -113,6 +113,38 @@ def stored_id(db: StructureDatabase, structure_id: str) -> str:
     return getattr(db, "merged_ids", {}).get(structure_id, structure_id)
 
 
+def request(ouro: Any, method: str, path: str, **kwargs) -> Any:
+    """The ``data`` of an Ouro API response, raising ``OuroError`` on failure."""
+    # Every call made through here (reads, upserts and updates by key,
+    # deletes by key) can safely run twice, so a gateway error or a
+    # dropped connection is retried a few times before it fails a run.
+    for attempt in range(len(RETRY_SECONDS) + 1):
+        try:
+            if method == "delete":
+                # A DELETE with a body goes through the client's generic request.
+                response = ouro.client.request("DELETE", path, **kwargs)
+            else:
+                response = getattr(ouro.client, method)(path, **kwargs)
+        except Exception as exc:
+            if attempt == len(RETRY_SECONDS) or not _is_connection_error(exc):
+                raise
+            logger.info("Retrying %s %s after %s", method.upper(), path, exc)
+        else:
+            if response.status_code not in RETRY_STATUSES or attempt == len(RETRY_SECONDS):
+                break
+            logger.info("Retrying %s %s after %d", method.upper(), path, response.status_code)
+        time.sleep(RETRY_SECONDS[attempt])
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    if response.status_code >= 400 or (isinstance(body, dict) and body.get("error")):
+        error = body.get("error") if isinstance(body, dict) else None
+        message = error.get("message") if isinstance(error, dict) else error
+        raise OuroError(f"{method.upper()} {path}: {response.status_code} {message or response.text[:300]}")
+    return body.get("data") if isinstance(body, dict) else body
+
+
 class OuroSharedDatabase:
     def __init__(self, ouro: Any, datasets: Dict[str, str], *, non_commercial: bool = False):
         """``datasets`` maps each table name to its dataset id.
@@ -134,34 +166,7 @@ class OuroSharedDatabase:
     # -------------------- Requests --------------------
 
     def _request(self, method: str, path: str, **kwargs) -> Any:
-        # Every call the store makes (reads, upserts and updates by key,
-        # deletes by key) can safely run twice, so a gateway error or a
-        # dropped connection is retried a few times before it fails a run.
-        for attempt in range(len(RETRY_SECONDS) + 1):
-            try:
-                if method == "delete":
-                    # A DELETE with a body goes through the client's generic request.
-                    response = self.ouro.client.request("DELETE", path, **kwargs)
-                else:
-                    response = getattr(self.ouro.client, method)(path, **kwargs)
-            except Exception as exc:
-                if attempt == len(RETRY_SECONDS) or not _is_connection_error(exc):
-                    raise
-                logger.info("Retrying %s %s after %s", method.upper(), path, exc)
-            else:
-                if response.status_code not in RETRY_STATUSES or attempt == len(RETRY_SECONDS):
-                    break
-                logger.info("Retrying %s %s after %d", method.upper(), path, response.status_code)
-            time.sleep(RETRY_SECONDS[attempt])
-        try:
-            body = response.json()
-        except ValueError:
-            body = {}
-        if response.status_code >= 400 or (isinstance(body, dict) and body.get("error")):
-            error = body.get("error") if isinstance(body, dict) else None
-            message = error.get("message") if isinstance(error, dict) else error
-            raise OuroError(f"{method.upper()} {path}: {response.status_code} {message or response.text[:300]}")
-        return body.get("data") if isinstance(body, dict) else body
+        return request(self.ouro, method, path, **kwargs)
 
     @property
     def tables(self) -> Dict[str, str]:
