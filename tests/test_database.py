@@ -249,6 +249,14 @@ def test_novelty_says_whether_a_match_was_observed(db):
     assert index.check(b2("Co", "Ni")).matches[0].experimental is None
 
 
+def test_novelty_ignores_oxidation_states(db):
+    add(db, rocksalt("Na", "Cl", 5.69), None, source="mp", source_id="mp-22862")
+    charged = rocksalt("Na", "Cl", 5.62)
+    charged.add_oxidation_state_by_element({"Na": 1, "Cl": -1})
+    result = db.novelty_index().check(charged)
+    assert result.status == KNOWN and result.matches[0].source_id == "mp-22862"
+
+
 def test_novelty_skips_candidates_of_another_size(db):
     add(db, b2("Fe", "Ni"), None, source="mp", source_id="mp-2")
     supercell = b2("Fe", "Ni")

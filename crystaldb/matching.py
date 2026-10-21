@@ -53,7 +53,14 @@ def primitive(structure: Structure) -> Structure:
     """``structure``'s primitive cell, Niggli-reduced the way the matcher
     would reduce it, so ``rms_distance`` can skip that step: the matcher's
     own reduction goes through a cache keyed by structure equality, which
-    cost most of the time of matching formulas with hundreds of structures."""
+    cost most of the time of matching formulas with hundreds of structures.
+
+    Oxidation states are dropped first: many experimental CIFs (COD's) declare
+    them, and Na+ never matches Na, so a charged cell would only ever match
+    other charged cells."""
+    if any(getattr(sp, "oxi_state", None) for sp in structure.composition):
+        structure = structure.copy()
+        structure.remove_oxidation_states()
     try:
         cell = structure.get_primitive_structure()
     except Exception:
