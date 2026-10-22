@@ -44,6 +44,7 @@ import gc
 import json
 import logging
 import math
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -201,6 +202,21 @@ def is_generated(source: Optional[str]) -> bool:
 def source_url(source: Optional[str], source_id: Optional[str]) -> Optional[str]:
     template = get_source(source).url
     return template.format(id=source_id) if template and source_id else None
+
+
+def submission_asset_id(source: Optional[str], source_id: Optional[str]) -> Optional[str]:
+    """The Ouro file a stored user submission came from.
+
+    The earliest submissions were keyed by user and formula, not by file,
+    so they have none.
+    """
+    if source != USER_SOURCE or not source_id:
+        return None
+    try:
+        uuid.UUID(source_id)
+    except ValueError:
+        return None
+    return source_id
 
 
 @dataclass

@@ -59,7 +59,13 @@ from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Composition, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 
-from .sources import USER_SOURCE, is_generated, is_published, record_license
+from .sources import (
+    USER_SOURCE,
+    is_generated,
+    is_published,
+    record_license,
+    submission_asset_id,
+)
 from .surfaces import DEFAULT_SURFACE, SOURCE_GEOMETRY, get_surface
 
 if TYPE_CHECKING:
@@ -147,6 +153,19 @@ def entry_id(row) -> str:
     if is_published(row["source"]) and row["source_id"]:
         return row["source_id"]
     return f"{row['source'] or 'ggen'}-{row['id']}"
+
+
+def entry_asset_ids(entries: Iterable[ComputedEntry]) -> Dict[str, str]:
+    """Ouro files of the user submissions among hull entries, by entry id.
+
+    Pass as ``asset_ids`` to ``ouro.utils.phase_diagram.phase_diagram_to_dict``
+    so the viewer links each submission to the file it came from.
+    """
+    return {
+        entry.entry_id: asset
+        for entry in entries
+        if (asset := submission_asset_id(entry.data.get("source"), entry.data.get("source_id")))
+    }
 
 
 CRYSTAL_SYSTEM_RANGES = (
