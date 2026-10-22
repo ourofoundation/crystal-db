@@ -59,7 +59,7 @@ from pymatgen.analysis.phase_diagram import PhaseDiagram
 from pymatgen.core import Composition, Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 
-from .sources import is_generated, record_license
+from .sources import USER_SOURCE, is_generated, is_published, record_license
 from .surfaces import DEFAULT_SURFACE, SOURCE_GEOMETRY, get_surface
 
 if TYPE_CHECKING:
@@ -133,6 +133,20 @@ def _now() -> str:
 
 def _bool_or_none(value: Optional[int]) -> Optional[bool]:
     return None if value is None else bool(value)
+
+
+def entry_id(row) -> str:
+    """How a stored structure is labeled in a phase diagram.
+
+    Published structures by their own id (``mp-149`` links to Materials
+    Project); user submissions as ``ouro-<file id>``; anything else as
+    ``<source>-<structure id>``.
+    """
+    if row["source"] == USER_SOURCE:
+        return f"ouro-{row['source_id']}"
+    if is_published(row["source"]) and row["source_id"]:
+        return row["source_id"]
+    return f"{row['source'] or 'ggen'}-{row['id']}"
 
 
 CRYSTAL_SYSTEM_RANGES = (
@@ -1229,23 +1243,20 @@ class StructureDatabase:
         ).fetchall()
 
     @staticmethod
-    def hull_entry(
-        row: Union[sqlite3.Row, Dict[str, Any]], entry_id: Optional[str] = None
-    ) -> ComputedEntry:
-        """A ComputedEntry for a hull row, labeled for phase diagram plots.
+    def hull_entry(row: Union[sqlite3.Row, Dict[str, Any]]) -> ComputedEntry:
+        """A ComputedEntry for a hull row, labeled by ``entry_id(row)``.
 
-        The default ``entry_id`` is a readable label; pass the source id
-        instead when a viewer should link entries (``mp-…`` opens Materials
-        Project).
+        The id is the structure's source id, so phase diagram viewers can link
+        each entry (``mp-…`` opens Materials Project); they show formula and
+        space group on their own.
         """
         comp = Composition(row["formula"])
-        sg = row["space_group_symbol"] or "?"
         source = (row["source"] or "ggen").lower()
         corrected = row["energy_per_atom"] + row["correction_per_atom"]
         return ComputedEntry(
             comp,
             corrected * comp.num_atoms,
-            entry_id=entry_id or f"{row['formula']} ({sg.replace('/', '-')}, {source})",
+            entry_id=entry_id(row),
             data={
                 "space_group": row["space_group_symbol"],
                 "structure_id": row["id"],

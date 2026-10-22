@@ -21,9 +21,10 @@ from pymatgen.core import Structure
 from pymatgen.entries.computed_entries import ComputedEntry
 
 from .corrections import Correction, mp2020_correction
+from .database import entry_id
 from .intake import ADDED, UPDATED, Intake, add_if_new
 from .references import Energies, fill_near_hull
-from .sources import USER_SOURCE, is_generated, is_published
+from .sources import USER_SOURCE, is_generated
 from .surfaces import get_surface
 from .validation import space_group
 
@@ -73,20 +74,6 @@ class Assessment:
     hull_surface: str = ""
 
 
-def entry_id(row) -> str:
-    """How a stored structure is labeled in a phase diagram.
-
-    Published structures by their own id (``mp-149`` links to Materials
-    Project); user submissions as ``ouro-<file id>``; anything else as
-    ``<source>-<structure id>``.
-    """
-    if row["source"] == USER_SOURCE:
-        return f"ouro-{row['source_id']}"
-    if is_published(row["source"]) and row["source_id"]:
-        return row["source_id"]
-    return f"{row['source'] or 'ggen'}-{row['id']}"
-
-
 def reference_entries(
     db: "StructureDatabase",
     chemical_system: str,
@@ -124,7 +111,7 @@ def reference_entries(
         label = entry_id(r)
         if r["source"] == USER_SOURCE:
             contributions.append(label)
-        entries.append(db.hull_entry(r, entry_id=label))
+        entries.append(db.hull_entry(r))
         by_source[r["source"]] = by_source.get(r["source"], 0) + 1
     return entries, by_source, contributions, incompatible
 
