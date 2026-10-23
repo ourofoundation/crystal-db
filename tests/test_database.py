@@ -285,30 +285,3 @@ def test_refuses_version_1_schema(tmp_path):
     conn.close()
     with pytest.raises(RuntimeError, match="version 1"):
         StructureDatabase(path)
-
-
-def test_hull_entries_can_be_limited_to_crystal_systems(db):
-    add(db, bcc("Fe"), -8.0)
-    add(db, fcc("Ni"), -5.5)
-    cubic = add(db, b2("Fe", "Ni"), -7.0, space_group_number=221, space_group_symbol="Pm-3m")
-    tetragonal = add(
-        db, b2("Fe", "Ni", lattice=3.0), -6.95, space_group_number=123, space_group_symbol="P4/mmm"
-    )
-    run = db.create_run("Fe-Ni")
-    db.conn.execute(
-        "INSERT INTO run_structures (run_id, structure_id) VALUES (?, ?)", (run, tetragonal)
-    )
-    db.conn.commit()
-
-    # Unfiltered, the formula's best cell is the cubic one.
-    assert cubic in {s.id for s in db.get_hull_entries("Fe-Ni", e_above_hull_cutoff=0.1)}
-    # Limited to tetragonal cells, the formula is represented by its best
-    # tetragonal cell, with its distance to the unchanged hull.
-    near = db.get_hull_entries("Fe-Ni", e_above_hull_cutoff=0.1, crystal_systems=["Tetragonal"])
-    assert [s.id for s in near] == [tetragonal]
-    assert near[0].e_above_hull == pytest.approx(0.05)
-    by_run = db.get_hull_entries(
-        "Fe-Ni", e_above_hull_cutoff=0.1, run_id=run, crystal_systems={"tetragonal"}
-    )
-    assert [s.id for s in by_run] == [tetragonal]
-    assert db.get_hull_entries("Fe-Ni", e_above_hull_cutoff=0.1, crystal_systems=["hexagonal"]) == []

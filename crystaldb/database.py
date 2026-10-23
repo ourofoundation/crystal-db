@@ -168,27 +168,6 @@ def entry_asset_ids(entries: Iterable[ComputedEntry]) -> Dict[str, str]:
     }
 
 
-CRYSTAL_SYSTEM_RANGES = (
-    (2, "triclinic"),
-    (15, "monoclinic"),
-    (74, "orthorhombic"),
-    (142, "tetragonal"),
-    (167, "trigonal"),
-    (194, "hexagonal"),
-    (230, "cubic"),
-)
-
-
-def crystal_system(space_group_number: Optional[int]) -> str:
-    """The crystal system an international space-group number belongs to,
-    or "unknown"."""
-    if space_group_number is not None and 1 <= space_group_number <= 230:
-        for last, name in CRYSTAL_SYSTEM_RANGES:
-            if space_group_number <= last:
-                return name
-    return "unknown"
-
-
 @dataclass
 class StoredStructure:
     """A structure stored in the database, with its values on one surface."""
@@ -1407,7 +1386,6 @@ class StructureDatabase:
         e_above_hull_cutoff: float = 0.0,
         run_id: Optional[str] = None,
         include_generated_p1: bool = True,
-        crystal_systems: Optional[Iterable[str]] = None,
     ) -> List[StoredStructure]:
         """
         Get structures on or near the convex hull, one per reduced formula.
@@ -1424,10 +1402,6 @@ class StructureDatabase:
                 structures generated in the given run are returned, and only
                 when they are the best of their formula.
             include_generated_p1: Passed to ``compute_hull``.
-            crystal_systems: If provided, only structures in these crystal
-                systems (names such as "tetragonal") are returned, and "best
-                of its formula" is judged among them. The hull itself, and so
-                every distance, is unchanged.
 
         Returns:
             List of StoredStructure objects on/near hull, sorted by e_above_hull
@@ -1450,13 +1424,6 @@ class StructureDatabase:
                 ids[start : start + 500],
             )
         }
-        if crystal_systems is not None:
-            wanted = {system.lower() for system in crystal_systems}
-            near = [
-                (e, sid)
-                for e, sid in near
-                if crystal_system(loaded[sid].space_group_number) in wanted
-            ]
         best: Dict[str, StoredStructure] = {}
         for e, sid in sorted(near, key=lambda item: (item[0], loaded[item[1]].energy_per_atom)):
             s = loaded[sid]
