@@ -149,9 +149,15 @@ class Candidate:
         return self._primitive
 
 
-def find_matches(structure: Structure, candidates: Iterable[Candidate]) -> List[Match]:
-    """Every candidate that is the same crystal as ``structure``, closest first."""
-    query = primitive(structure)
+def find_matches(
+    structure: Structure,
+    candidates: Iterable[Candidate],
+    query: Optional[Structure] = None,
+) -> List[Match]:
+    """Every candidate that is the same crystal as ``structure``, closest first.
+
+    ``query`` is ``primitive(structure)`` when the caller has it already."""
+    query = primitive(structure) if query is None else query
     matches: List[Match] = []
     for candidate in candidates:
         # Primitive cells of different sizes never match, and a stored cell
@@ -257,7 +263,8 @@ class NoveltyIndex:
 
         prior_art = [c for c in candidates if is_published(c.source)]
         ouro = [c for c in candidates if not is_published(c.source)]
-        matches = find_matches(structure, prior_art)
+        query = primitive(structure)
+        matches = find_matches(structure, prior_art, query=query)
         if matches:
             status = KNOWN
         elif prior_art:
@@ -268,7 +275,9 @@ class NoveltyIndex:
             status=status,
             reduced_formula=reduced,
             matches=matches,
-            ouro_matches=find_matches(structure, ouro) if include_ouro else [],
+            ouro_matches=(
+                find_matches(structure, ouro, query=query) if include_ouro else []
+            ),
             same_formula_counts=counts,
         )
 

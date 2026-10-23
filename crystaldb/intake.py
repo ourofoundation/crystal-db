@@ -27,6 +27,7 @@ from .matching import Match, NoveltyResult
 from .validation import space_group
 
 if TYPE_CHECKING:
+    from .matching import NoveltyIndex
     from .database import StructureDatabase
 
 ADDED = "added"
@@ -87,14 +88,17 @@ def add_if_new(
     source_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     run_id: Optional[str] = None,
+    index: Optional["NoveltyIndex"] = None,
 ) -> Intake:
     """Store ``structure`` on ``db.surface`` unless an equal one is stored.
 
     When the equal structure has no energy on this surface yet, it takes this
     one's geometry and energy, so the work is not lost. ``run_id`` links the
-    stored (or matched) structure to a generator run.
+    stored (or matched) structure to a generator run. ``index`` is the
+    NoveltyIndex to match against (its candidates are cached per formula);
+    by default a fresh one over ``db``.
     """
-    novelty = db.novelty_index().check(structure)
+    novelty = (index or db.novelty_index()).check(structure)
     composition = structure.composition
     stoichiometry = {el.symbol: int(n) for el, n in composition.element_composition.items()}
     sg_number, sg_symbol = space_group(structure)
@@ -229,7 +233,13 @@ def add_unique(
     structure (published, or from any earlier run) is linked to ``run_id``
     instead of stored again. ``keep`` limits each formula to its lowest
     converged representatives. Returns (representative, copies, intake).
+
+    The representatives are matched against the database as it was when the
+    call started, through one shared index: ``collapse`` already told them
+    apart from each other, so matching each against the ones stored just
+    before it would only repeat that work.
     """
+    index = db.novelty_index()
     groups: Dict[str, List[Generated]] = {}
     for item in items:
         groups.setdefault(item.structure.composition.reduced_formula, []).append(item)
@@ -246,6 +256,7 @@ def add_unique(
                 source=source,
                 metadata={**(item.metadata or {}), "copies": copies},
                 run_id=run_id,
+                index=index,
             )
             out.append((item, copies, intake))
     return out
